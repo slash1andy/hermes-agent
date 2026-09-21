@@ -66,6 +66,17 @@ acceptance, unreadable policy or GitHub API failures. A repository without requi
 checks needs a local-only contract. `gh` must be authenticated with read access to
 the repository's checks and rules; no remote writes are performed by this gate.
 
+`GymCoreHQ/gymcore`'s `main` branch is a documented exception: as a private fork
+without a paid GitHub plan, its Rulesets API returns "Upgrade to GitHub Pro or
+make this repository public to enable this feature." instead of real branch
+protection. For that repo/branch only, six named GitHub Actions check runs
+(app `15368`) are required by explicit policy regardless of what GitHub reports;
+any additional requirement GitHub *does* discover is unioned in, never dropped.
+Receipts mark these entries `"source": "policy"` vs `"server"` so the provenance
+is never confused with fictitious branch protection. Every other repo and branch
+keeps deriving required checks from GitHub alone, and any other 403 there still
+fails closed as an infrastructure error.
+
 Rejection retains the active card and workspace. Durable `pr_acceptance` events
 store PR URL, SHA, required contexts, check IDs/URLs, classifications and recovery
 instructions; `last_failure_error` surfaces the next step. Fix failures, rerun

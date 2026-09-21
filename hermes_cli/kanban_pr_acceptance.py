@@ -13,6 +13,29 @@ from urllib.parse import quote
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
+# GymCoreHQ/gymcore is a private fork with no paid GitHub plan, so its branch
+# protection can't pin required-status-checks the normal way. This is the
+# explicit, Andrew-approved floor for that repo's main branch only — every
+# other repo/branch keeps deriving required checks from GitHub alone.
+_POLICY_REPO = "GymCoreHQ/gymcore"
+_POLICY_BRANCH = "main"
+_POLICY_APP_ID = 15368  # GitHub Actions app (databaseId), not this repo's own app
+_POLICY_REQUIRED_CONTEXTS = (
+    "composer test-all + metadata",
+    "gym-core-ai PHPUnit + PHPStan",
+    "changed-asset lint + build",
+    "root static pytest",
+    "customer-docs",
+    "php -l",
+)
+# The documented plan-limited error the Rulesets API returns for a private
+# repo without GitHub Pro/Team. Only THIS exact message on THIS repo/branch is
+# treated as "no additional server-discoverable requirements" — any other 403
+# (bad auth, rate limit, wrong repo) still fails closed as infra.
+_POLICY_PLAN_LIMITED_RE = re.compile(
+    r"Upgrade to GitHub Pro or make this repository public to enable this feature\.\s*\(HTTP 403\)"
+)
+
 
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
@@ -59,15 +82,29 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         receipt["head_sha"] = sha
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
+        is_policy_scope = (repo, branch) == (_POLICY_REPO, _POLICY_BRANCH)
+        policy_required = {(c, _POLICY_APP_ID) for c in _POLICY_REQUIRED_CONTEXTS} if is_policy_scope else set()
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
-        required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        discovered = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        except subprocess.CalledProcessError as exc:
+            # Union, never discard: a discovery outage never drops the policy floor,
+            # and outside GymCoreHQ/gymcore@main this always re-raises to infra as before.
+            if not (is_policy_scope and _POLICY_PLAN_LIMITED_RE.search(exc.stderr or "")):
+                raise
+            rules = []
+            receipt["server_discovery"] = "unavailable (GitHub plan limitation); explicit policy requirements applied"
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
-                    required.update((r["context"], r.get("integration_id"))
+                    discovered.update((r["context"], r.get("integration_id"))
                                     for r in rule["parameters"]["required_status_checks"])
-        receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
+        required = policy_required | discovered
+        if policy_required:
+            receipt["policy_source"] = f"explicit:{_POLICY_REPO}@{_POLICY_BRANCH}"
+        receipt["required"] = [{"context": c, "app_id": a, "source": "policy" if (c, a) in policy_required else "server"}
+                                for c, a in sorted(required, key=str)]
         if not required:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
