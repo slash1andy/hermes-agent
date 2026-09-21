@@ -1986,6 +1986,34 @@ def _latest_event(
     return conn.execute(sql + " ORDER BY id DESC LIMIT 1", params).fetchone()
 
 
+def _triage_routed_by_loop_breaker(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the task's *current* triage placement was caused by the
+    unblock-loop breaker (``block_task``'s ``block_loop_detected`` routing,
+    see :func:`_route_block`), not by something else that happened since.
+
+    ``block_kind`` alone cannot answer this: it deliberately survives
+    ``unblock_task`` (see its docstring), so a task blocked once below
+    ``BLOCK_RECURRENCE_LIMIT`` and then unblocked still carries a stale
+    non-null ``block_kind`` even after landing in triage for an unrelated
+    reason (e.g. ``kanban_transfer._relocate_imported_rows`` parking a
+    workspace-repointing task). Instead, walk this task's events newest
+    first and use whichever of the two triage-routing events happened last:
+    a ``block_loop_detected`` event, or an ``imported`` event whose payload
+    says this row was actually parked into triage by that import (every row
+    gets an ``imported`` event, parked or not).
+    """
+    for row in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('block_loop_detected', 'imported') ORDER BY id DESC",
+        (task_id,),
+    ):
+        if row["kind"] == "block_loop_detected":
+            return True
+        if _json_dict(row["payload"]).get("parked"):
+            return False
+    return False
+
+
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     """``review`` when the newest lifecycle event carries a review
     ``resume_status``/``retry_status``/``source_status``, else ``ready`` (legacy)."""
