@@ -333,10 +333,16 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column, excluding cards whose
+    *current* triage placement was caused by the unblock-loop breaker (see
+    ``kb._triage_routed_by_loop_breaker``). Those are retry-circuit cards for
+    a human, not genuine intake. ``block_kind`` alone is not a reliable
+    signal here: it survives ``unblock_task``, so a card can carry a stale
+    non-null ``block_kind`` from an earlier sub-threshold block yet still be
+    genuine intake (e.g. parked into triage by a board import)."""
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        return [row.id for row in rows if not kb._triage_routed_by_loop_breaker(conn, row.id)]
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
