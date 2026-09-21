@@ -12,6 +12,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
+from hermes_cli.kanban_pr_acceptance import _parse_paginated
 
 GYMCORE_REPO = "GymCoreHQ/gymcore"
 GYMCORE_APP_ID = 15368
@@ -37,12 +38,21 @@ def _executable_dir():
 
 
 def _write_gh_shim(gh_path: Path, port: int) -> None:
+    # The fixture HTTP handlers return one JSON array of "pages" per paginated
+    # endpoint. Real `gh api --paginate` (without --slurp, unsupported on the
+    # deployed 2.46.0 CLI) writes each page as its own concatenated JSON
+    # document with no separator, so the shim re-serializes that way here to
+    # match what _api()/_parse_paginated must actually parse.
     gh_path.write_text(
         f"#!{sys.executable}\n"
         "import sys, json, urllib.request, urllib.error\n"
         f"u = 'http://127.0.0.1:{port}/' + sys.argv[2]\n"
         "try:\n"
-        "    print(urllib.request.urlopen(u).read().decode())\n"
+        "    body = urllib.request.urlopen(u).read().decode()\n"
+        "    if '--paginate' in sys.argv:\n"
+        "        sys.stdout.write(''.join(json.dumps(page) for page in json.loads(body)))\n"
+        "    else:\n"
+        "        print(body)\n"
         "except urllib.error.HTTPError as e:\n"
         "    try:\n"
         "        msg = json.loads(e.read().decode()).get('message', '')\n"
@@ -59,6 +69,18 @@ def _last_receipt(conn, tid):
         "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance' ORDER BY id DESC", (tid,)
     ).fetchone()
     return json.loads(row[0]) if row else None
+
+
+def test_parse_paginated_returns_each_document_as_a_page():
+    assert _parse_paginated('{"total_count": 1}{"total_count": 2}') == [
+        {"total_count": 1}, {"total_count": 2}]
+    assert _parse_paginated('[1, 2]\n[3]') == [[1, 2], [3]]
+
+
+@pytest.mark.parametrize("stdout", ["", "  \n", "{not json}", '{"a": 1}trailing garbage'])
+def test_parse_paginated_fails_closed(stdout):
+    with pytest.raises(ValueError):
+        _parse_paginated(stdout)
 
 
 @pytest.fixture

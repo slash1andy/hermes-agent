@@ -45,15 +45,34 @@ def validate_contract(value: str | None) -> str:
     return value
 
 
+def _parse_paginated(stdout: str) -> list:
+    """Parse the sequential JSON documents `gh api --paginate` writes (one per
+    page, concatenated with no separator) without depending on --slurp, which
+    the deployed gh CLI (2.46.0) predates.
+    """
+    decoder = json.JSONDecoder()
+    pages = []
+    index, length = 0, len(stdout)
+    while index < length:
+        if stdout[index].isspace():
+            index += 1
+            continue
+        page, index = decoder.raw_decode(stdout, index)
+        pages.append(page)
+    if not pages:
+        raise ValueError("gh api --paginate returned no JSON documents")
+    return pages
+
+
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
     command = ["gh", "api", endpoint, "--hostname", "github.com"]
     if query is not None:
         command += ["-f", "query=" + query]
     if paginate:
-        command += ["--paginate", "--slurp"]
+        command += ["--paginate"]
     result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
                             text=True, timeout=30, check=True)
-    value = json.loads(result.stdout)
+    value = _parse_paginated(result.stdout) if paginate else json.loads(result.stdout)
     if isinstance(value, dict) and value.get("errors"):
         raise ValueError("GitHub returned incomplete GraphQL evidence")
     return value
