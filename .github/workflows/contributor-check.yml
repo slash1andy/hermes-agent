@@ -24,8 +24,12 @@ jobs:
       - name: Check for unmapped contributor emails
         id: check-emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Get the merge base between this PR and its actual target branch
+          # (PRs may target a branch other than main, e.g. a stacked PR);
+          # GITHUB_BASE_REF is only set for pull_request(_target) triggers,
+          # so non-PR runs (push, schedule) keep scanning against main.
+          BASE_REF="${GITHUB_BASE_REF:-main}"
+          MERGE_BASE=$(git merge-base "origin/${BASE_REF}" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
