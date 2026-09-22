@@ -162,3 +162,59 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_list_triage_ids_excludes_block_loop_cards(kanban_home):
+    """``list_triage_ids`` feeds both the gateway auto-decompose sweep and
+    ``kanban decompose --all``; it must skip retry-circuit cards whose
+    *current* triage placement was caused by the unblock-loop breaker
+    (``block_task``'s ``block_loop_detected`` routing) while still picking up
+    genuine intake triage cards -- including one with a stale non-null
+    ``block_kind`` (#117412: ``block_kind`` deliberately survives
+    ``unblock_task``, so it cannot be used as the signal; a card blocked once
+    below ``BLOCK_RECURRENCE_LIMIT``, unblocked, and later parked into triage
+    by ``kanban_transfer._relocate_imported_rows`` for an unrelated reason
+    must remain eligible). Explicit single-id decompose bypasses this
+    function entirely and is unaffected."""
+    from hermes_cli import kanban_transfer
+
+    with kbc.connect() as conn:
+        intake_id = kb.create_task(conn, title="genuine intake", triage=True)
+
+        # Blocked once (sub-threshold), then unblocked, then parked into
+        # triage by an import -- not by the loop breaker. Stale block_kind
+        # must not exclude it.
+        stale_id = kb.create_task(
+            conn, title="workspace repointing", assignee="worker", workspace_kind="dir",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (stale_id,))
+        assert kb.claim_task(conn, stale_id, claimer="worker") is not None
+        kb.block_task(conn, stale_id, reason="x", kind="capability")
+        kb.unblock_task(conn, stale_id)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (stale_id,))
+        stale_task = kb.get_task(conn, stale_id)
+        assert stale_task.block_kind == "capability"
+        kanban_transfer._relocate_imported_rows(conn, kb.get_current_board())
+        stale_task = kb.get_task(conn, stale_id)
+        assert stale_task.status == "triage"
+        assert stale_task.block_kind == "capability"
+
+        retry_id = kb.create_task(conn, title="retry loop", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (retry_id,))
+        assert kb.claim_task(conn, retry_id, claimer="worker") is not None
+        kb.block_task(conn, retry_id, reason="x", kind="capability")
+        kb.unblock_task(conn, retry_id)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (retry_id,))
+        assert kb.claim_task(conn, retry_id, claimer="worker") is not None
+        kb.block_task(conn, retry_id, reason="x", kind="capability")
+
+        retry_task = kb.get_task(conn, retry_id)
+        assert retry_task.status == "triage"
+        assert retry_task.block_kind == "capability"
+
+    ids = decomp.list_triage_ids()
+    assert intake_id in ids
+    assert stale_id in ids
+    assert retry_id not in ids
