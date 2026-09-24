@@ -8764,6 +8764,35 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _resolve_child_write_safe_root(workspace: str, board: Optional[str]) -> Optional[str]:
+    """Return the child's ``HERMES_WRITE_SAFE_ROOT``, or ``None`` if unsafe.
+
+    Only the claimed task's own workspace qualifies: it must resolve (no
+    symlink loops) to an existing, absolute directory that sits *strictly
+    inside* the current board's workspace root. The board root itself,
+    anything outside it, and any escape via ``..`` or symlinks are
+    rejected — a worker must never get write-safety scoped to a directory
+    wider than its own task workspace.
+    """
+    if not workspace or not os.path.isabs(workspace):
+        return None
+    try:
+        resolved_ws = os.path.realpath(workspace, strict=True)
+    except OSError:
+        return None
+    if not os.path.isdir(resolved_ws):
+        return None
+    try:
+        resolved_root = os.path.realpath(str(workspaces_root(board=board)), strict=True)
+    except OSError:
+        return None
+    if resolved_ws == resolved_root:
+        return None
+    if os.path.commonpath([resolved_ws, resolved_root]) != resolved_root:
+        return None
+    return resolved_ws
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8867,6 +8896,16 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
+    # Scope the worker's write-safety boundary to its own claimed task
+    # workspace. An inherited HERMES_WRITE_SAFE_ROOT (from the dispatching
+    # gateway's own env) must never leak into the child unless the task
+    # workspace itself validates as safe — otherwise a worker could write
+    # anywhere the gateway could.
+    safe_root = _resolve_child_write_safe_root(workspace, resolved_board)
+    if safe_root is not None:
+        env["HERMES_WRITE_SAFE_ROOT"] = safe_root
+    else:
+        env.pop("HERMES_WRITE_SAFE_ROOT", None)
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
