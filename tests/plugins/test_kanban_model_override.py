@@ -9,6 +9,7 @@ PATCH/bulk/model-options surfaces.
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -161,6 +162,7 @@ def _spawn_and_capture(monkeypatch, tmp_path, task):
 
     def fake_popen(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
+        captured["env"] = kwargs.get("env") or {}
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -200,6 +202,61 @@ def test_spawn_no_override_omits_both_flags(monkeypatch, tmp_path, conn):
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     assert "-m" not in cmd
     assert "--provider" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# Worker spawn — child HERMES_WRITE_SAFE_ROOT workspace boundary
+# ---------------------------------------------------------------------------
+
+
+def _spawn_env(monkeypatch, task, workspace):
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["env"] = kwargs.get("env") or {}
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    kb._default_spawn(task, str(workspace))
+    return captured["env"]
+
+
+def test_spawn_write_safe_root_permitted_workspace(monkeypatch, conn):
+    tid = kb.create_task(conn, title="t", assignee="elias")
+    task = kb.get_task(conn, tid)
+    root = kb.workspaces_root()
+    root.mkdir(parents=True, exist_ok=True)
+    workspace = root / "task-1"
+    workspace.mkdir()
+    env = _spawn_env(monkeypatch, task, workspace)
+    assert env["HERMES_WRITE_SAFE_ROOT"] == os.path.realpath(str(workspace))
+
+
+def test_spawn_write_safe_root_removes_broad_inherited_root(monkeypatch, conn):
+    # The board's workspace root itself is not "strictly inside" the root,
+    # so it must be rejected even though a broad root was inherited from
+    # the dispatching gateway's own environment.
+    tid = kb.create_task(conn, title="t", assignee="elias")
+    task = kb.get_task(conn, tid)
+    root = kb.workspaces_root()
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(root.parent))
+    env = _spawn_env(monkeypatch, task, root)
+    assert "HERMES_WRITE_SAFE_ROOT" not in env
+
+
+def test_spawn_write_safe_root_outside_board_rejected(monkeypatch, tmp_path, conn):
+    tid = kb.create_task(conn, title="t", assignee="elias")
+    task = kb.get_task(conn, tid)
+    kb.workspaces_root().mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-ws"
+    outside.mkdir()
+    env = _spawn_env(monkeypatch, task, outside)
+    assert "HERMES_WRITE_SAFE_ROOT" not in env
 
 
 # ---------------------------------------------------------------------------
