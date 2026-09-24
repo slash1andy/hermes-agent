@@ -273,6 +273,7 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    auto: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks.
 
@@ -283,12 +284,15 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        eligible = not auto or task_id in kb.list_auto_decompose_ids(conn)
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    if not eligible:
+        return DecomposeOutcome(task_id, False, "not genuine new intake")
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -369,6 +373,7 @@ def decompose_task(
                 body=body_val,
                 assignee=assignee_val,
                 author=audit_author,
+                intake_only=auto,
             )
         if not ok:
             return DecomposeOutcome(
@@ -438,6 +443,7 @@ def decompose_task(
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
+                intake_only=auto,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
@@ -456,9 +462,14 @@ def decompose_task(
     )
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+def list_triage_ids(*, tenant: Optional[str] = None, auto: bool = False) -> list[str]:
+    """Return task ids currently in the triage column.
+
+    ``auto=True`` keeps only genuine new intake (no escalation/decompose history).
+    """
     with kb.connect_closing() as conn:
+        if auto:
+            return kb.list_auto_decompose_ids(conn, tenant=tenant)
         rows = kb.list_tasks(
             conn,
             status="triage",

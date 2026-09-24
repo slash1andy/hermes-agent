@@ -349,3 +349,20 @@ def test_decompose_no_aux_client_configured(kanban_home):
     assert outcome.ok is False
     # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
     assert "LLM error" in outcome.reason
+
+
+def test_auto_selection_skips_non_intake_and_is_idempotent(kanban_home):
+    with kb.connect() as conn:
+        fresh = kb.create_task(conn, title="fresh", triage=True)
+        esc = kb.create_task(conn, title="escalated", triage=True)
+        kb._append_event(conn, esc, "block_loop_detected", {"kind": "x"})
+        conn.commit()
+    assert decomp.list_triage_ids(auto=True) == [fresh]
+    assert set(decomp.list_triage_ids()) == {fresh, esc}  # manual path unchanged
+    with kb.connect() as conn:
+        kb.decompose_triage_task(
+            conn, fresh, root_assignee="o", children=[{"title": "a"}], intake_only=True,
+        )
+    assert decomp.list_triage_ids(auto=True) == []
+    out = decomp.decompose_task(esc, author="auto-decomposer", auto=True)
+    assert out.ok is False

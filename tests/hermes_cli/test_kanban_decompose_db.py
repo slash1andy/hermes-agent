@@ -228,3 +228,91 @@ def test_decompose_per_child_workspace_override(kanban_home):
         inh = kb.get_task(conn, child_ids[1])
     assert over.workspace_path == "/other/repo"
     assert inh.workspace_path == proj
+
+
+# --- auto-decompose eligibility: only genuine new intake -------------------
+
+_ONE_CHILD = [{"title": "only step", "parents": []}]
+
+
+def _auto(conn, tid):
+    return kb.decompose_triage_task(
+        conn, tid, root_assignee="orch", children=_ONE_CHILD, intake_only=True,
+    )
+
+
+def test_fresh_triage_is_auto_eligible_and_decomposes(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        assert kb.list_auto_decompose_ids(conn) == [tid]
+        assert _auto(conn, tid)
+
+
+def test_retry_circuit_triage_is_excluded(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        # Escalation record left by the block-loop breaker.
+        conn.execute("UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?", (tid,))
+        conn.commit()
+        assert kb.list_auto_decompose_ids(conn) == []
+        assert _auto(conn, tid) is None
+        assert kb.get_task(conn, tid).status == "triage"
+
+        # Generic retry-circuit (failure-limit) escalation: gave_up event.
+        t2 = _create_triage(conn)
+        kb._append_event(conn, t2, "gave_up", {"error": "boom"})
+        conn.commit()
+        assert t2 not in kb.list_auto_decompose_ids(conn)
+        assert _auto(conn, t2) is None
+
+
+def test_already_decomposed_root_is_excluded_no_duplicate_graph(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        assert _auto(conn, tid)
+        # Root later escalates back to triage; repeated ticks must not refan.
+        conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))
+        conn.commit()
+        assert kb.list_auto_decompose_ids(conn) == []
+        assert _auto(conn, tid) is None
+        assert _auto(conn, tid) is None
+        n = conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE child_id = ?", (tid,)
+        ).fetchone()[0]
+        assert n == 1
+
+
+def test_changed_task_rejected_at_mutation_boundary(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        assert kb.list_auto_decompose_ids(conn) == [tid]  # selected while eligible
+        kb._append_event(conn, tid, "block_loop_detected", {"kind": "x"})
+        conn.commit()  # new escalation lands before the mutation
+        assert _auto(conn, tid) is None
+        assert kb.specify_triage_task(conn, tid, title="t", intake_only=True) is False
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_linked_task_excluded_and_rejected_at_mutation_boundary(kanban_home):
+    for as_parent in (False, True):
+        with kb.connect() as conn:
+            tid = _create_triage(conn)
+            other = kb.create_task(conn, title="other")
+            assert tid in kb.list_auto_decompose_ids(conn)  # selected while unlinked
+            a, b = (tid, other) if as_parent else (other, tid)
+            conn.execute(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (a, b)
+            )
+            conn.commit()  # graph link lands before the mutation
+            assert tid not in kb.list_auto_decompose_ids(conn)
+            assert _auto(conn, tid) is None
+            assert kb.specify_triage_task(conn, tid, title="t", intake_only=True) is False
+            assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_human_held_work_untouched(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="held", initial_status="blocked")
+        assert kb.list_auto_decompose_ids(conn) == []
+        assert _auto(conn, tid) is None
+        assert kb.get_task(conn, tid).status == "blocked"

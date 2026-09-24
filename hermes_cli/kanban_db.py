@@ -5761,6 +5761,33 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+# Genuine new intake = triage with no escalation history and no graph links.
+# Anything the block-loop / failure circuit breakers routed here, a root that
+# was already fanned out, or a task already wired into a graph needs a human,
+# not another automatic decomposition.
+_INTAKE_ONLY_SQL = (
+    " AND block_kind IS NULL AND NOT EXISTS (SELECT 1 FROM task_events e"
+    " WHERE e.task_id = tasks.id AND e.kind IN"
+    " ('block_loop_detected', 'gave_up', 'decomposed'))"
+    " AND NOT EXISTS (SELECT 1 FROM task_links l"
+    " WHERE l.parent_id = tasks.id OR l.child_id = tasks.id)"
+)
+
+
+def list_auto_decompose_ids(
+    conn: sqlite3.Connection, *, tenant: Optional[str] = None, limit: int = 1000,
+) -> list[str]:
+    """Ids of triage tasks that are genuine new intake (auto-decompose safe)."""
+    sql = "SELECT id FROM tasks WHERE status = 'triage'" + _INTAKE_ONLY_SQL
+    params: list[Any] = []
+    if tenant is not None:
+        sql += " AND tenant = ?"
+        params.append(tenant)
+    sql += " ORDER BY created_at, id LIMIT ?"
+    params.append(limit)
+    return [r["id"] for r in conn.execute(sql, params).fetchall()]
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5769,6 +5796,7 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    intake_only: bool = False,
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
@@ -5791,7 +5819,8 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'"
+            + (_INTAKE_ONLY_SQL if intake_only else ""),
             (task_id,),
         ).fetchone()
         if existing is None:
@@ -5860,6 +5889,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    intake_only: bool = False,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -5946,7 +5976,8 @@ def decompose_triage_task(
     with write_txn(conn):
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?",
+            "FROM tasks WHERE id = ?"
+            + (_INTAKE_ONLY_SQL if intake_only else ""),
             (task_id,),
         ).fetchone()
         if root_row is None:
