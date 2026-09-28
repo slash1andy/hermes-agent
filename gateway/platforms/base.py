@@ -926,6 +926,57 @@ def _path_is_within(path: Path, root: Path) -> bool:
     return False
 
 
+def _media_delivery_profile_path_allowed(resolved: Path) -> bool:
+    """Keep private Hermes files inside the profile that produced the delivery.
+
+    The named-profile check must precede the shared root check: a root-profile turn owns
+    ``<root>`` but never ``<root>/profiles/<name>``. Kanban attachments remain the existing
+    deliberately shared exception; operator roots do not get that exception when nested in a
+    private Hermes home.
+    """
+    from agent.secret_scope import current_secret_scope_home, is_multiplex_active
+
+    if not is_multiplex_active():
+        return True
+
+    root = _resolve_path(_HERMES_ROOT, expand=True)
+    if root is None:
+        return False
+
+    owner = None
+    profiles_root = root / "profiles"
+    with contextlib.suppress(ValueError):
+        relative = resolved.relative_to(profiles_root)
+        if relative.parts:
+            # Enumeration may be unavailable while the resolved path still identifies its
+            # profile structurally. Symlinked profile directories outside the canonical root
+            # remain enumeration-based below.
+            owner = profiles_root / relative.parts[0]
+    if owner is None:
+        for profile_dir in _profile_dirs():
+            profile_root = _resolve_path(profile_dir, expand=True)
+            if profile_root is not None and _path_is_within(resolved, profile_root):
+                owner = profile_root
+                break
+    if owner is None and _path_is_within(resolved, root):
+        owner = root
+    if owner is None:
+        return True
+
+    # Board attachments are an intentional shared output surface, including an explicitly
+    # configured external attachment root. Keep this exception narrower than operator roots.
+    for attachment_root in _kanban_attachment_roots():
+        shared_root = _resolve_path(attachment_root, expand=True)
+        if shared_root is not None and _path_is_within(resolved, shared_root):
+            return True
+
+    active_home = current_secret_scope_home()
+    if not active_home:
+        return False
+    active_root = _resolve_path(Path(active_home), expand=True)
+    return active_root is not None and active_root == owner
+
+
 def _tenv(name: str, default: str = "") -> str:
     """Scope-aware TERMINAL_* read: the per-turn scope carries the ACTIVE profile's settings while
     os.getenv reads whatever a prior turn pinned into the process env. Only ImportError falls
@@ -1124,6 +1175,10 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     if resolved is None:
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
+        return None
+    # In multiplex mode, private Hermes paths belong only to the active scoped profile. This
+    # precedes every allowlist/strict/recency branch so operator roots cannot widen ownership.
+    if not _media_delivery_profile_path_allowed(resolved):
         return None
     # Cache / operator allowlist is trusted unconditionally, regardless of mode.
     for root in _media_delivery_allowed_roots():

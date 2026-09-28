@@ -7,6 +7,7 @@ only renders as a voice bubble when explicitly flagged) and via
 ``GatewayRunner._deliver_media_from_response``.
 """
 
+from contextlib import nullcontext
 import importlib
 import sys
 import types
@@ -94,6 +95,7 @@ def _fake_runner(thread_meta):
     runner = SimpleNamespace(
         _thread_metadata_for_source=lambda source, anchor=None: thread_meta,
         _reply_anchor_for_event=lambda event: None,
+        _media_delivery_scope_for_source=lambda source: nullcontext(),
     )
     return runner
 
