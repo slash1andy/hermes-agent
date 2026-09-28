@@ -1671,19 +1671,7 @@ class TurnRunner:
         _prepare_inbound_message_text buffered image paths; consume-and-clear so later turns on the
         same runner never re-attach stale images. Falls back to plain text when nothing is readable."""
         ctx = self._ctx
-        native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
-        if not native_imgs:
-            return ctx.message
-        try:
-            from agent.image_routing import build_native_content_parts
-            parts, skipped = build_native_content_parts(ctx.message, native_imgs)
-            if skipped:
-                logger.warning("Native image attachment: skipped %d unreadable path(s): %s", len(skipped), skipped)
-            if any(p.get("type") == "image_url" for p in parts):
-                return parts
-        except Exception as exc:
-            logger.warning("Native image attachment failed, falling back to text: %s", exc)
-        return ctx.message
+        return self._runner._native_image_run_message(ctx.message, ctx.session_key)
 
     def _run_conversation_with_approval(self, agent, agent_history, observed_group_context,
                                         persist_user_message_override, persist_user_timestamp_override):

@@ -2792,12 +2792,15 @@ class GatewayTurnMixin:
 
         # OpenAI chat format. The remote keeps continuity via X-Hermes-Session-Id; send the current
         # message plus a compact text-only history for a remote that has none yet.
-        api_messages: List[Dict[str, str]] = [{"role": "system", "content": context_prompt}] if context_prompt else []
+        api_messages: List[Dict[str, Any]] = [{"role": "system", "content": context_prompt}] if context_prompt else []
         api_messages += [
             {"role": msg.get("role"), "content": msg.get("content")}
             for msg in history if msg.get("role") in {"user", "assistant"} and msg.get("content")
         ]
-        api_messages.append({"role": "user", "content": message})
+        message_content = await asyncio.to_thread(
+            getattr(self, "_native_image_run_message"), message, session_key,
+        )
+        api_messages.append({"role": "user", "content": message_content})
 
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if proxy_key:

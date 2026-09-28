@@ -1744,12 +1744,28 @@ class GatewayInboundMixin:
         _, successful_transcripts = await self._transcribe_pending_audio_event_once(event, "")
         return "\n\n".join(t.strip() for t in successful_transcripts if t.strip())
 
-    def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
+    def _consume_pending_native_image_paths(self, session_key: Optional[str]) -> List[str]:
         state = self._peek_session_state(session_key)
         paths = list(state.persistent.native_image_paths or []) if state is not None else []
         if paths:
             state.persistent.native_image_paths = []
         return paths
+
+    def _native_image_run_message(self, message: Any, session_key: Optional[str]) -> Any:
+        """Build the native multimodal user content for one session, consuming its one-shot paths."""
+        native_imgs = self._consume_pending_native_image_paths(session_key)
+        if not native_imgs:
+            return message
+        try:
+            from agent.image_routing import build_native_content_parts
+            parts, skipped = build_native_content_parts(message, native_imgs)
+            if skipped:
+                logger.warning("Native image attachment: skipped %d unreadable path(s): %s", len(skipped), skipped)
+            if any(p.get("type") == "image_url" for p in parts):
+                return parts
+        except Exception as exc:
+            logger.warning("Native image attachment failed, falling back to text: %s", exc)
+        return message
 
     async def _mark_durable_active_turn(self, event: "MessageEvent", session_key: str) -> bool:
         """Persist the exact resolved routing key for this running turn."""
