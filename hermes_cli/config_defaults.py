@@ -1766,6 +1766,11 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Whether THIS process may run cron work locally (script/agent/tick dispatch) — read from
+        # its OWN launch config, never a served profile's (shared-transport guard, not an OS
+        # sandbox: cron/scheduler_admission.py). Only literal `true` enables; any other explicit
+        # value or an unparsable config denies. Absent preserves this default.
+        "execution_enabled": True,
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
         # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
         # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs

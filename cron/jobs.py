@@ -2704,12 +2704,50 @@ def claim_job_for_fire(
         job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
         # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
+        pre_claim_next_run_at = job.get("next_run_at")
         if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
             nxt = compute_next_run(job["schedule"], now.isoformat())
             if nxt:
                 job["next_run_at"] = nxt
         save_jobs(jobs)
-        return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
+        if not return_job:
+            return True
+        # Ephemeral only (never persisted): lets a caller that later denies dispatch AFTER this
+        # claim (release_denied_fire_claim) restore the pre-advance instant in one CAS.
+        return dict(
+            copy.deepcopy(job), _scheduled_instant=instant,
+            _pre_claim_next_run_at=pre_claim_next_run_at)
+
+    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+
+
+def release_denied_fire_claim(
+    job_id: str, *, expected_owner: str, expected_next_run_at: Any = None,
+    restore_next_run_at: Optional[str] = None,
+) -> bool:
+    """Release a ``fire_claim`` THIS acquisition made, when local dispatch was denied AFTER the
+    claim (the before-dispatch path never claims at all — nothing to release there).
+
+    Owner-fenced like ``heartbeat_fire_claim``: a claim already replaced by a successor (a
+    different ``by`` token) is left completely untouched — never cleared, never overwritten.
+    ``next_run_at`` is restored to *restore_next_run_at* only as a CAS: the CURRENT value must
+    still equal *expected_next_run_at* (this claim's own advance), so a schedule/admin edit made
+    after the claim is never clobbered. Same fence + lock as ``claim_job_for_fire``. Does not touch
+    ``pending_slot``/the executions ledger: ``cron.occurrences.completed_occurrence`` already
+    treats a non-'completed' attempt as eligible for replay.
+    """
+    def apply(jobs, _i, job):
+        claim = job.get("fire_claim")
+        owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+        if owner != expected_owner:
+            return False
+        job.pop("fire_claim", None)
+        if (restore_next_run_at is not None
+                and job.get("next_run_at") == expected_next_run_at
+                and job.get("schedule", {}).get("kind") in {"cron", "interval"}):
+            job["next_run_at"] = restore_next_run_at
+        save_jobs(jobs)
+        return True
 
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
 

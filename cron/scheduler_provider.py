@@ -179,6 +179,15 @@ class CronScheduler(ABC):
         before acknowledging, then pass the exact snapshot to ``fire_claimed`` off-thread."""
         from cron.executions import create_execution, finish_execution, set_execution_occurrence
         from cron.jobs import claim_job_for_fire
+        from cron.scheduler_admission import cron_execution_denied_reason
+
+        # Transport-process execution admission, BEFORE any execution/claim record is created:
+        # a denied manual/webhook/dashboard fire must leave the job's next_run_at and fire_claim
+        # untouched, not consume the occurrence and then fail.
+        _denied = cron_execution_denied_reason()
+        if _denied is not None:
+            logger.warning("Fire claim for job '%s' denied: %s", job_id, _denied)
+            return None
 
         execution = create_execution(job_id, source=self.name)
         claim_kwargs = {"return_job": True}

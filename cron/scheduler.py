@@ -2172,6 +2172,17 @@ def _prepare_job_prompt(
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
     injection block, empty prompt); otherwise ``prompt`` is set."""
+    # Transport-process execution admission — must dominate every other gate below (no_agent,
+    # config-parse, monitor, wake): a denied process launches neither a script subprocess nor an
+    # AIAgent, regardless of job shape. cron/scheduler_admission.py; independent of delivery-queue
+    # draining, which never routes through run_job.
+    from cron.scheduler_admission import cron_execution_denied_reason
+
+    _denied = cron_execution_denied_reason()
+    if _denied is not None:
+        logger.warning("Job '%s': %s", job_id, _denied)
+        return (False, f"# Cron Job: {job_name}\n\nError: {_denied}\n", "", _denied), None
+
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     if not job.get("no_agent"):
@@ -2711,6 +2722,28 @@ def run_one_job(
     claim (callers use the store CAS) but keeps it alive. True if processed (a job failure is
     recorded via ``mark_job_run``), False only if processing raised. ``cancel_event``: optional
     transport-level cancel (dashboard drain)."""
+    # Transport-process admission. The tick and the built-in fire path (claim_fire) already deny
+    # BEFORE claiming, so this normally only covers a caller that hands run_one_job a job dict
+    # directly; but policy can also flip AFTER a real claim_fire (claim_fire allowed, fire_claimed
+    # denied) — release that claim here so the occurrence stays immediately re-runnable rather than
+    # stuck until FIRE_CLAIM_TTL_SECONDS expires.
+    from cron.jobs import release_denied_fire_claim
+    from cron.scheduler_admission import cron_execution_denied_reason
+
+    _denied = cron_execution_denied_reason()
+    if _denied is not None:
+        logger.warning("Job '%s': %s", job.get("id"), _denied)
+        _execution_id = job.get("execution_id")
+        if _execution_id:
+            finish_execution(str(_execution_id), success=False, error=_denied)
+        _claim = job.get("fire_claim")
+        if isinstance(_claim, dict) and _claim.get("by"):
+            release_denied_fire_claim(
+                job["id"], expected_owner=str(_claim["by"]),
+                expected_next_run_at=job.get("next_run_at"),
+                restore_next_run_at=job.get("_pre_claim_next_run_at"))
+        return True
+
     # Every gateway path (built-in scheduler, external providers, and direct
     # API fires) crosses this seam.  Ensure the detached worker has a durable
     # attempt to adopt before any launch can occur.
@@ -4028,6 +4061,12 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    # advance_next_runs() (scheduler_tick.py) already advanced the whole due batch's next_run_at
+    # BEFORE this claim ran, so claim_job_for_fire's own _pre_claim_next_run_at snapshot is that
+    # already-advanced value, not the original due slot. The due-scan's `job` (captured before the
+    # batch advance) still carries the true original instant — a denied-after-claim run must
+    # restore to THAT, not to the tick's own intermediate advance.
+    claimed_job["_pre_claim_next_run_at"] = job.get("next_run_at")
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 

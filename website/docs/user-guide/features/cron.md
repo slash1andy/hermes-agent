@@ -1361,3 +1361,14 @@ Cron jobs run in a completely fresh agent session. The prompt must contain every
 ## Security
 
 Scheduled task prompts are scanned for prompt-injection and credential-exfiltration patterns at creation and update time. Prompts containing invisible Unicode tricks, SSH backdoor attempts, or obvious secret-exfiltration payloads are blocked.
+
+## Disabling local execution on a shared transport process
+
+`cron.execution_enabled` (default `true`) controls whether **this process** may run cron work locally — launch a job's script, construct an agent for it, or dispatch a due job from its own tick. Set it to `false` in the config of the profile this process was **launched as** (which may itself be a named profile, e.g. `hermes -p work gateway run`) to stop that process from executing local cron jobs while it keeps serving other traffic (a Photon listener multiplexing several profiles, for example, where execution is meant to happen on remote isolated executors instead).
+
+A few things this setting is and is not:
+
+- It is read from the config of the profile this process was **launched as**, independent of any OTHER profile it merely serves (multiplexing) during a given tick or turn — a served profile's own `config.yaml` cannot re-enable execution from inside that served scope, and setting it back to `true` there has no effect on this process's own policy.
+- Only the literal boolean `true` enables execution. Any other explicit value (a string, a number, `null`), or a `cron` section that isn't a mapping, or a process config that fails to parse, **denies** — this setting fails closed rather than silently falling back to enabled. Leaving the key out entirely preserves the current default (enabled).
+- It does not touch delivery: the delivery queue (results already produced elsewhere) keeps draining and delivering on this process regardless of this setting. This is a dispatch/execution guard, not a queue toggle.
+- **It is a configuration guard, not an OS-level sandbox.** It does not provide process isolation, filesystem/network confinement, or a container boundary — it only decides whether this process's scheduler may start local cron work. A complete isolated-delivery runtime (real container boundaries, media/background/auth isolation) is a separate, later piece of work.

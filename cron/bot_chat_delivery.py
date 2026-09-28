@@ -96,7 +96,8 @@ def drain(root: Path | None = None) -> None:
 
 def _drain(root: Path) -> None:
     """Claim before execution. Errors/interruptions never authorize another turn."""
-    from cron.scheduler_delivery import _deliver_to_bot_chat
+    from cron.scheduler_admission import cron_execution_denied_reason
+    from cron.scheduler_delivery import BOT_CHAT_EXECUTION_DENIED_MARKER, _deliver_to_bot_chat
     from tools.bot_live_delivery import find_canonical_live_owner, find_canonical_owner
 
     with _FileLock(root / ".lock"):
@@ -119,10 +120,19 @@ def _drain(root: Path) -> None:
                 continue
             try:
                 owner = find_canonical_owner(home)
-                if owner is not None and find_canonical_live_owner(home) is None:
+                live_owner = find_canonical_live_owner(home)
+                if owner is not None and live_owner is None:
                     continue
             except Exception:
                 # Discovery uncertainty is not permission to launch.
+                continue
+            # A live-owner handoff is not local execution and stays available regardless of this
+            # process's cron.execution_enabled policy; anything else here would fall through to
+            # the CLI fallback, so a denied process must not even claim it — closing most of the
+            # race cheaply. The deep guard inside _deliver_to_bot_chat (BOT_CHAT_EXECUTION_DENIED_
+            # MARKER below) is what actually closes it: the owner can still disappear between here
+            # and the delivery attempt.
+            if live_owner is None and cron_execution_denied_reason() is not None:
                 continue
             record["status"] = "claimed"
             atomic_json_write(path, record, fsync_dir=True, mode=0o600)
@@ -134,6 +144,14 @@ def _drain(root: Path) -> None:
             # The claim survives uncertainty; one failed attempt must not stop peers.
             error = f"{type(exc).__name__}: {exc}"
             logger.exception("Deferred Bot Chat delivery %s failed", record["id"])
+        if error == BOT_CHAT_EXECUTION_DENIED_MARKER:
+            # Confirmed never-started (not an arbitrary error string — an exact sentinel): the
+            # claim never reached an attempt, so it goes back to "queued" for a later, permitted
+            # drain — never a terminal disposition like a real uncertain/failed attempt gets.
+            with _FileLock(root / ".lock"):
+                record.update(status="queued", error=None)
+                atomic_json_write(path, record, fsync_dir=True, mode=0o600)
+            continue
         receipt = job.get("_bot_chat_delivery_receipts", {}).get(
             f"bot-chat:{record['profile'] or '(own)'}")
         status = "transferred" if receipt else "ambiguous" if error else "settled"

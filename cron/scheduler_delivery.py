@@ -872,6 +872,17 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         # Discovery/admission uncertainty must never open a second-writer fallback.
         return f"bot-chat delivery to profile '{profile_label}' unverified: {exc}"
 
+    # Shared transport-process execution admission — checked here, the one boundary every CLI
+    # fallback caller crosses, BEFORE any env/tempfile/subprocess work. A live-owner handoff never
+    # reaches this line (it already returned above); this also closes the race where an owner was
+    # live at _drain's pre-check but is gone by the time we get here.
+    from cron.scheduler_admission import cron_execution_denied_reason
+
+    _denied = cron_execution_denied_reason()
+    if _denied is not None:
+        logger.warning("Job '%s': bot-chat CLI fallback denied — %s", job_id, _denied)
+        return BOT_CHAT_EXECUTION_DENIED_MARKER
+
     # The running install first (same trust order as gateway.run._resolve_hermes_bin): the
     # scheduler lives in the long-running gateway, so a PATH-first lookup would hand delivery
     # to whatever `hermes` PATH names — another install, or a planted one — instead of this one.
@@ -1010,6 +1021,14 @@ _ROUTING_TOKENS = frozenset({"all"})
 BOT_CHAT_PLATFORM = "bot-chat"
 # Bot Chat is the TUI/Desktop transcript, so its warning policy is display.platforms.tui.
 BOT_CHAT_POLICY_PLATFORM = "tui"
+
+# Exact-match sentinel (never embedded in a larger message): the CLI fallback below was denied by
+# this transport process's own cron.execution_enabled policy BEFORE any subprocess/env/tempfile
+# work — nothing was attempted. cron.bot_chat_delivery._drain compares against this exact string
+# (never parses/infers from arbitrary error text) to know the record must go back to "queued"
+# rather than a terminal ("ambiguous"/"transferred") disposition; a live-owner handoff never
+# reaches this — it already returned above — so an accepted receipt is untouched either way.
+BOT_CHAT_EXECUTION_DENIED_MARKER = "bot-chat-cli-fallback-denied-by-cron-execution-policy"
 
 
 def parse_bot_chat_deliver_token(part: str) -> Optional[str]:
