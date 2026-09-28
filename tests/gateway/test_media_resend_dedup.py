@@ -23,6 +23,7 @@ sibling):
 
 import asyncio
 import logging
+from contextlib import nullcontext
 import threading
 import time
 from types import SimpleNamespace
@@ -485,6 +486,7 @@ async def test_streamed_explicit_media_resend_is_delivered(tmp_path, monkeypatch
     runner = SimpleNamespace(
         _thread_metadata_for_source=lambda source, anchor=None: {},
         _reply_anchor_for_event=lambda event: None,
+        _media_delivery_scope_for_source=lambda source: nullcontext(),
     )
 
     await GatewayRunner._deliver_media_from_response(
