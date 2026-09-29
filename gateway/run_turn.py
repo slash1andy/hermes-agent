@@ -1231,7 +1231,11 @@ class GatewayTurnMixin:
         mirror. The detached-agent path would only rewrite the mirror and its finally-eviction
         would destroy the live thread (next turn starts blank), so use the cached agent's
         thread/compact/start and KEEP it cached."""
+        from gateway.proxy_admission import admit_local_maintenance
         from gateway.run import run_codex_hygiene_compaction
+        # Re-check immediately before the cached-agent codex call boundary: this path never
+        # reaches _hmwa_hygiene_build_agent, so it needs its own guard.
+        admit_local_maintenance()
         # codex app-server runtime: the model's real context is the app-server's server-side thread, not the
         # transcript mirror. See #73503.
         _hyg_codex_auto = "native"
@@ -1251,6 +1255,7 @@ class GatewayTurnMixin:
     async def _hmwa_hygiene_build_agent(self, _hyg_model, _hyg_runtime, session_entry):
         """Build the detached hygiene ``AIAgent`` with the live session's system prompt. Returns
         ``(agent, sync_session_db)``."""
+        from gateway.proxy_admission import admit_local_maintenance
         from gateway.run import _GATEWAY_HYGIENE_PLATFORM, _seed_hygiene_system_prompt
         from run_agent import AIAgent
         try:
@@ -1271,6 +1276,9 @@ class GatewayTurnMixin:
         _hyg_checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"), default=False,
         )
+        # Re-check immediately before local construction: the await above (get_session) is another
+        # window for a late flip.
+        admit_local_maintenance()
         _hyg_agent = AIAgent(
             **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
             skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
@@ -1349,15 +1357,29 @@ class GatewayTurnMixin:
         """Auto-compress pathologically large transcripts before the agent starts so oversized
         histories don't cause repeated truncation/context failures. Token source: the API's
         prompt_tokens from the last turn, else a char/4 estimate."""
+        from gateway.proxy_admission import ProxyPolicyError, admit_local_maintenance
         from gateway.run import HygieneTurnHoldExceeded
         if not history or len(history) < 4:
             return history
+        try:
+            admit_local_maintenance()
+        except ProxyPolicyError:
+            # Preserve the original history; denial must not bound native remote input.
+            return history
 
         hs = await self._hmwa_hygiene_settings(source, session_key)
+        try:
+            admit_local_maintenance()
+        except ProxyPolicyError:
+            return history
         # Hygiene can never land with compression disabled; a sub-limit transcript is the identity (#111988).
         if not hs.compression_enabled:
             return self._bound_hygiene_payload(history, hs, session_entry)
         plan = await self._hmwa_hygiene_plan(hs, history, session_entry, session_key)
+        try:
+            admit_local_maintenance()
+        except ProxyPolicyError:
+            return history
         # No compression this turn (under both thresholds, cooldown, or one already in flight): without
         # the bound the model would get the full uncompressed transcript.
         if not plan.needs_compress:
@@ -1385,6 +1407,9 @@ class GatewayTurnMixin:
             # Must not hit the generic "auto-compress failed" warning below: that log is how thinking-model
             # deployments read as permanently broken (#97963; surfaced by @686f6c61 in PR #99657).
             pass
+        except ProxyPolicyError:
+            # Preserve the original history; a late denial must not bound it.
+            return history
         except Exception as e:
             logger.warning("Session hygiene auto-compress failed: %s", e)
         # A landed compression published a NEW transcript on attempt.history: leave it byte-identical.

@@ -475,6 +475,7 @@ class GatewaySessionCommandsMixin:
 
         See #73503.
         """
+        from gateway.proxy_admission import ProxyPolicyError, admit_local_maintenance
         from gateway.run import _AGENT_PENDING_SENTINEL
 
         agent = self._cached_agent_for(session_key, lockless_fallback=True)
@@ -483,6 +484,12 @@ class GatewaySessionCommandsMixin:
                 "🗜️ Nothing to compact: this session runs on the Codex app-server runtime, whose "
                 "context lives in a Codex-owned thread that only exists while the agent is active. "
                 "Send a message first, then /compress — or /reset to start fresh.")
+        try:
+            # Re-check immediately before the cached-agent codex call boundary: this path never
+            # reaches _build_manual_compression_agent.
+            admit_local_maintenance()
+        except ProxyPolicyError as exc:
+            return f"🗜️ Manual compression is refused: {exc}"
         compressor = getattr(agent, "context_compressor", None)
         count_before = getattr(compressor, "compression_count", 0)
         try:
@@ -527,7 +534,15 @@ class GatewaySessionCommandsMixin:
         """Build a temporary agent, run the shared compress core, persist, and describe the outcome."""
         from agent.conversation_compression import finalize_context_engine_compression_notification
         from agent.conversation_compression_manual import compress_now, render_compress_result
+        from gateway.proxy_admission import ProxyPolicyError, admit_local_maintenance
         from gateway.run import _platform_config_key
+
+        try:
+            admit_local_maintenance()
+        except ProxyPolicyError as exc:
+            # Fixed, honest refusal before any runtime/provider resolution or local construction —
+            # --preview (above, in the caller) stays read-only and unaffected.
+            return f"🗜️ Manual compression is refused: {exc}"
 
         session_key = self._session_key_for_source(source)
         # Platform + stable gateway session key bind this agent (for external context engines) to
@@ -577,6 +592,7 @@ class GatewaySessionCommandsMixin:
     async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
         """Build the throwaway AIAgent that performs a manual /compress rewrite of *session_id*."""
         from run_agent import AIAgent
+        from gateway.proxy_admission import admit_local_maintenance
         from gateway.run import _GATEWAY_HYGIENE_PLATFORM, _seed_hygiene_system_prompt
         from hermes_cli.config import load_config as _load_cfg
         from utils import is_truthy_value as _is_truthy
@@ -599,6 +615,9 @@ class GatewaySessionCommandsMixin:
         _checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"),
             default=False)
+        # Re-check immediately before local construction: the await above (get_session) is another
+        # window for a late flip.
+        admit_local_maintenance()
         tmp_agent = AIAgent(**runtime_kwargs, model=model, max_iterations=4, quiet_mode=True,
                             skip_memory=not _checkpoint_required, enabled_toolsets=["memory"],
                             session_id=session_id,

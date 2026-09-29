@@ -81,6 +81,7 @@ def _install_synthetic_seam(evidence_path: Path) -> None:
             record = dict(
                 self._base_record, content_kind=content_kind, data_urls=data_urls, task_id=task_id,
                 user_message=user_message if isinstance(user_message, str) else None,
+                conversation_history=conversation_history,
             )
             _append_evidence(evidence_path, record)
             text = f"echo:{self.gateway_session_key or ''}:{user_message}" if content_kind == "text" \
