@@ -25,6 +25,7 @@ import pytest
 import yaml
 from aiohttp import web
 
+import hermes_constants
 from agent import secret_scope as ss
 from gateway.config import GatewayConfig, PlatformConfig
 from gateway.platforms.api_server import (
@@ -40,8 +41,10 @@ from gateway.session import Platform, SessionSource, build_session_key
 @pytest.fixture(autouse=True)
 def _reset_multiplex():
     ss.set_multiplex_active(False)
+    hermes_constants.pin_process_hermes_home(None)
     yield
     ss.set_multiplex_active(False)
+    hermes_constants.pin_process_hermes_home(None)
 
 
 class _SyntheticAIAgent:
@@ -186,6 +189,13 @@ async def test_native_api_server_threads_declared_session_key_to_agent_construct
         extra_env={"GATEWAY_PROXY_URL": f"{base_url}/p/owner-a", "GATEWAY_PROXY_KEY": "wrong-key-for-owner-a"})
     home_client_a_noauth = _profile_home(
         tmp_path, "client-a-noauth", extra_env={"GATEWAY_PROXY_URL": f"{base_url}/p/owner-a"})
+
+    # This process's OWN launch config (pinned, not merely a served profile) declares the required
+    # proxy admission policy true. It must not change one bit of the existing remote-positive
+    # behaviour below: a configured proxy URL still makes exactly one real request per call.
+    (home_client_a / "config.yaml").write_text(
+        yaml.safe_dump({"gateway": {"proxy_required": True}}), encoding="utf-8")
+    hermes_constants.pin_process_hermes_home(str(home_client_a))
 
     profiles = {
         "owner-a": home_owner_a, "owner-b": home_owner_b,

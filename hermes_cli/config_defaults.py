@@ -2208,6 +2208,12 @@ DEFAULT_CONFIG = {
         # Recency window in seconds; 600 covers a multi-tool turn. Bridged to
         # HERMES_MEDIA_TRUST_RECENT_SECONDS. Only consulted when strict is true.
         "trust_recent_files_seconds": 600,
+        # Ordinary-turn admission guard, not a transport-wide claim: when true, this process's OWN
+        # launch config (never a served profile's) must resolve a usable proxy URL
+        # (GATEWAY_PROXY_URL / gateway.proxy_url) or the turn is refused rather than falling back to
+        # local execution (gateway/proxy_admission.py). Absent/false preserves ordinary local turns.
+        # Any explicit non-bool value or an unparsable/malformed root config fails closed (denies).
+        "proxy_required": False,
         "api_server": {  # OpenAI-compatible API server platform (gateway/platforms/api_server.py).
             # Max concurrent agent runs. Requests to /v1/chat/completions, /v1/responses, and
             # /v1/runs beyond this get HTTP 429 + Retry-After, bounding CPU/memory/LLM-quota
@@ -3105,10 +3111,12 @@ OPTIONAL_ENV_VARS = {
         "for the default profile). Useful for multi-user setups with OpenWebUI.",
         "API server model name", None, advanced=True),
     "GATEWAY_PROXY_URL": _msg(
-        "URL of a remote Hermes API server to forward messages to (proxy mode). When set, the "
-        "gateway handles platform I/O only — all agent work is delegated to the remote server. "
-        "Use for Docker E2EE containers that relay to a host agent. Also configurable via "
-        "gateway.proxy_url in config.yaml.",
+        "URL of a remote Hermes API server to forward ordinary turns to (proxy mode). When set, "
+        "this gateway instance handles platform I/O only — its ordinary-turn agent execution runs "
+        "on the remote server instead of locally. Use for Docker E2EE containers that relay to a "
+        "host agent. Also configurable via gateway.proxy_url in config.yaml; "
+        "gateway.proxy_required makes this required (refusing local execution rather than falling "
+        "back to it) when no usable proxy URL resolves.",
         "Remote Hermes API server URL (e.g. http://192.168.1.100:8642)", None, advanced=True),
     "GATEWAY_PROXY_KEY": _msg(
         "Bearer token for authenticating with the remote Hermes API server (proxy mode). Must "

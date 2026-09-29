@@ -2757,13 +2757,19 @@ class GatewayTurnMixin:
 
         Lets a Docker container handle Matrix E2EE while the agent runs on the host with full
         access to local files, memory, skills, and a unified session store."""
+        from gateway.proxy_admission import PROXY_REQUIRED_KEY
         from gateway.run import _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS
         try:
             from aiohttp import ClientSession as _AioClientSession, ClientTimeout
         except ImportError:
             return self._proxy_error_result("⚠️ Proxy mode requires aiohttp. Install with: pip install aiohttp")
 
-        proxy_url = self._get_proxy_url()
+        try:
+            proxy_url = self._get_proxy_url()
+        except Exception:
+            return self._proxy_error_result(
+                f"⚠️ {PROXY_REQUIRED_KEY} could not be resolved safely — refusing this turn."
+            )
         if not proxy_url:
             return self._proxy_error_result("⚠️ Proxy URL not configured (GATEWAY_PROXY_URL or gateway.proxy_url)")
 
@@ -4233,11 +4239,33 @@ class GatewayTurnMixin:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
-        if self._get_proxy_url():
+        from gateway.proxy_admission import PROXY_REQUIRED_KEY, ProxyPolicyError, gateway_proxy_required
+
+        try:
+            proxy_required = gateway_proxy_required()
+        except ProxyPolicyError as exc:
+            return self._proxy_error_result(
+                f"⚠️ {PROXY_REQUIRED_KEY} could not be confirmed safe — refusing this turn: {exc}"
+            )
+
+        try:
+            proxy_url = self._get_proxy_url()
+        except Exception:
+            # A malformed served-profile URL (wrong type) or a resolver fault must never leak its
+            # raw exception text, nor fall through to local execution while the URL is unresolved.
+            return self._proxy_error_result(
+                f"⚠️ {PROXY_REQUIRED_KEY} could not be resolved safely — refusing this turn."
+            )
+        if proxy_url:
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
+            )
+        if proxy_required:
+            return self._proxy_error_result(
+                f"⚠️ {PROXY_REQUIRED_KEY} is set but no usable proxy URL is configured — "
+                "refusing local execution for this turn."
             )
 
         from run_agent import AIAgent
