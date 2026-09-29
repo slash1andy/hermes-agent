@@ -313,6 +313,8 @@ These env vars are NOT set on the host — they're injected into Docker sandboxe
 
 These are set automatically by the Docker terminal backend when `proxy.enabled: true` AND the daemon is running. You don't set them yourself; the relevant operator-facing knobs are in `~/.hermes/config.yaml` under the `proxy:` section — see [Egress proxy → Configuration](../user-guide/egress/iron-proxy.md#configuration).
 
+For inbound images, a required proxy or configured proxy skips the listener's image capability, provider, and vision-enrichment preparation. Images from the original own profile use native byte forwarding instead, with a late policy check before dispatch. Without a proxy, local image preparation remains unchanged when the policy is absent or false; this does not assert vision capability for the eventual executor.
+
 ## Messaging
 
 | Variable | Description |
@@ -559,6 +561,8 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `MESSAGING_CWD` | Deprecated compatibility fallback for gateway working directory. Prefer `terminal.cwd` in `config.yaml`. |
 | `GATEWAY_ALLOWED_USERS` | Comma-separated user IDs allowed across all platforms |
 | `GATEWAY_ALLOW_ALL_USERS` | Allow all users without allowlists (`true`/`false`, default: `false`). Also configurable via `gateway.allow_all_users` in `config.yaml`; the env var wins when both are set. |
+
+For gateway proxy mode, inbound images from the original profile use native byte forwarding and receive a late local-image-preparation policy check; this does not guarantee vision capability in the eventual executor. Voice/STT, pending voice, video, document availability, `@context`, slash commands, scripts, and runtime OS boundaries remain separate gates. These settings do not claim that all media works across isolated executors.
 
 ### Web Dashboard & Hermes Desktop
 

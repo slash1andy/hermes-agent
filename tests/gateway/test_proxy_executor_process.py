@@ -133,6 +133,9 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         home_client_a = _profile_home(
             tmp_path, "client-a",
             extra_env={"GATEWAY_PROXY_URL": f"{base_url}/p/owner-a", "GATEWAY_PROXY_KEY": key_owner_a})
+        for image_home in (home_owner_a, home_client_a):
+            (image_home / "config.yaml").write_text(
+                yaml.safe_dump({"agent": {"image_input_mode": "text"}}), encoding="utf-8")
         home_client_b = _profile_home(
             tmp_path, "client-b",
             extra_env={"GATEWAY_PROXY_URL": f"{base_url}/p/owner-b", "GATEWAY_PROXY_KEY": key_owner_b})
@@ -146,6 +149,7 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
             yaml.safe_dump({
                 "gateway": {"proxy_required": True},
                 "compression": {"enabled": True, "hygiene_hard_message_limit": 10},
+                "agent": {"image_input_mode": "text"},
             }), encoding="utf-8")
         hermes_constants.pin_process_hermes_home(str(parent_root))
 
@@ -163,11 +167,19 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
 
         parent_constructed: List[Any] = []
         parent_runtime_calls: List[Any] = []
+        parent_vision_calls: List[Any] = []
         import run_agent
+        from tools import vision_tools
         monkeypatch.setattr(run_agent, "AIAgent", lambda **kw: parent_constructed.append(kw) or None)
         monkeypatch.setattr(
             "gateway.run._resolve_runtime_agent_kwargs",
             lambda: (parent_runtime_calls.append(True), {})[1])
+
+        async def forbidden_parent_vision(*args, **kwargs):
+            parent_vision_calls.append((args, kwargs))
+            raise AssertionError("required-proxy image admission must not run parent vision")
+
+        monkeypatch.setattr(vision_tools, "vision_analyze_tool", forbidden_parent_vision)
 
         client_runner = _client_runner()
         source = _source()
@@ -205,11 +217,29 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         assert "401" in wrong_auth_result["final_response"]
         assert len(_read_evidence(evidence_path)) == 3, "wrong auth must be refused before any construction"
 
-        # -- background dispatch with an attached image, separate (None) memory identity --
+        # -- foreground image admission: preparation itself must cross the required proxy --
         image_path = home_client_a / "cache" / "images" / "img_native_test.png"
         image_path.parent.mkdir(parents=True, exist_ok=True)
         image_path.write_bytes(_TINY_PNG)
         expected_data_url = f"data:image/png;base64,{base64.b64encode(_TINY_PNG).decode('ascii')}"
+
+        source.profile = "client-a"
+        image_event = MessageEvent(
+            text="describe this image", source=source, message_id="foreground-image",
+            media_urls=[str(image_path)], media_types=["image/png"],
+        )
+        prepared_image_text = await client_runner._prepare_profile_scoped_inbound_message_text(
+            event=image_event, source=source, history=[], session_key=key_a,
+        )
+        assert prepared_image_text is not None
+        image_result = await client_runner._run_agent(
+            prepared_image_text, "fixture system", [], source, "fixture-image", session_key=key_a)
+        assert image_result["final_response"] == f"echo:{key_a}:image:fixture-image"
+        assert image_result["completed"] is True
+        assert image_result["final_response"] != f"echo:{key_a}:{prepared_image_text}"
+        assert len(_read_evidence(evidence_path)) == 4
+
+        # -- background dispatch with an attached image, separate (None) memory identity --
 
         bg_runner = _make_background_runner()
         bg_runner.config = GatewayConfig(multiplex_profiles=True)
@@ -240,8 +270,8 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
 
         # -- evidence written by the CHILD process (genuinely separate pid) --
         records = _read_evidence(evidence_path)
-        assert len(records) == 4, "3 foreground A/B/A + 1 background image dispatch"
-        agent_a1, agent_b, agent_a2, agent_bg = records
+        assert len(records) == 5, "3 foreground A/B/A + 1 foreground + 1 background image dispatch"
+        agent_a1, agent_b, agent_a2, agent_image, agent_bg = records
 
         authored_at_final_model = [
             message for message in agent_a1["conversation_history"]
@@ -265,6 +295,14 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         assert [r["session_id"] for r in (agent_a1, agent_b, agent_a2)] == [
             "session-fixture", "session-fixture", "session-fixture-next",
         ]
+        assert agent_image["session_id"] == "fixture-image"
+        assert agent_image["gateway_session_key"] == key_a
+        assert agent_image["home"] == str(home_owner_a)
+        assert agent_image["pid"] == child_pid
+        assert agent_image["session_db_id"] == agent_a1["session_db_id"]
+        assert agent_image["content_kind"] == "image"
+        assert agent_image["data_urls"] == [expected_data_url]
+        assert str(image_path) not in json.dumps(agent_image, ensure_ascii=False)
         assert len(generated_background_ids) == 1
         assert agent_bg["session_id"] == agent_bg["task_id"] == generated_background_ids[0]
         assert agent_bg["session_id"] not in {agent_a1["session_id"], agent_b["session_id"], agent_a2["session_id"]}
@@ -285,13 +323,14 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         assert agent_bg["data_urls"] == [expected_data_url]
         assert agent_bg["home"] == str(home_owner_a)
 
-        # -- wrong auth never reached agent construction on the child: still exactly 4 records --
-        assert len(_read_evidence(evidence_path)) == 4
+        # -- wrong auth never reached agent construction on the child: it was still exactly 3 records --
+        assert len(_read_evidence(evidence_path)) == 5
 
         # -- the PARENT (required=true) never constructs a native agent or resolves local
         #    runtime kwargs: the configured proxy is exclusively used --
         assert parent_constructed == []
         assert parent_runtime_calls == []
+        assert parent_vision_calls == []
     finally:
         proc.terminate()
         try:

@@ -6,7 +6,7 @@ description: "Set up Hermes Agent as a Matrix bot"
 
 # Matrix Setup
 
-Hermes Agent integrates with Matrix, the open, federated messaging protocol. Matrix lets you run your own homeserver or use a public one like matrix.org — either way, you keep control of your communications. The bot connects via the `mautrix` Python SDK, processes messages through the Hermes Agent pipeline (including tool use, memory, and reasoning), and responds in real time. It supports text, file attachments, images, audio, video, and optional end-to-end encryption (E2EE).
+Hermes Agent integrates with Matrix, the open, federated messaging protocol. Matrix lets you run your own homeserver or use a public one like matrix.org — either way, you keep control of your communications. The bot connects via the `mautrix` Python SDK, processes messages through the Hermes Agent pipeline (including tool use, memory, and reasoning), and responds in real time. It supports text, file attachments, images, audio, video, and optional end-to-end encryption (E2EE), subject to the separate gates for each media type and operation.
 
 Hermes works with any Matrix homeserver — Synapse, Conduit, Dendrite, or matrix.org.
 
@@ -827,6 +827,8 @@ Proxy mode is configured on the **container side** (the thin gateway):
 | `GATEWAY_PROXY_KEY` | Bearer token for authentication (must match `API_SERVER_KEY` on the host) |
 | `gateway.proxy_url` | Same as `GATEWAY_PROXY_URL` but in `config.yaml` |
 | `gateway.proxy_required` | `config.yaml` boolean (default `false`). When `true` on this container's own launch config, ordinary turns and `/bg` tasks require a usable proxy URL; they do not fall back to local execution. Authenticated native API agent requests are denied (403), unreadable policy is unavailable (503), and a late policy change fails the completion. Required root policy makes the listener skip automatic session hygiene without truncating its history; the native executor retains its own automatic compression. Warning: native session-header continuations use the executor SessionDB; moving an existing session requires migrating that transcript, not automatic request-history import; manual non-preview `/compress` is refused, while preview and executor-local mode remain available. This is not a remote manual-compression endpoint or full execution isolation. Remote executors keep absent/false policy. Health and authenticated cron delivery continue; slash commands, inbound media, raw API, and runtime OS boundaries remain distinct. |
+
+For gateway proxy mode, inbound images from the original profile use native byte forwarding and receive a late local-image-preparation policy check; this does not guarantee vision capability in the eventual executor. Voice/STT, pending voice, video, document availability, `@context`, slash commands, scripts, and runtime OS boundaries remain separate gates. These settings do not claim that all media works across isolated executors.
 
 The host side needs:
 

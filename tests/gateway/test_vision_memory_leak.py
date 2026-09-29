@@ -17,14 +17,15 @@ import pytest
 
 
 @pytest.fixture
-def gateway_runner():
-    """Minimal GatewayRunner stub with just the method under test bound."""
+def gateway_runner(monkeypatch):
+    """Real runner uses isolated default local policy; no config is written."""
+    from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
 
-    class _Stub:
-        _enrich_message_with_vision = GatewayRunner._enrich_message_with_vision
-
-    return _Stub()
+    monkeypatch.delenv("GATEWAY_PROXY_URL", raising=False)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    return runner
 
 
 def _run(coro):
