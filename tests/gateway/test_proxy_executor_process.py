@@ -1,4 +1,4 @@
-"""Real two-OS-process required-proxy admission test.
+"""Real two-OS-process required-proxy admission test with seeded executor continuity.
 
 ``test_proxy_memory_identity.py`` and ``test_proxy_background.py`` host the client dispatch AND
 the native ``_create_agent`` receiver in the SAME process, so they exercise real in-process
@@ -12,7 +12,8 @@ as a genuinely separate OS process (``tests/gateway/proxy_executor_fixture.py``,
 ``AIAgent`` construction/execution are a labelled synthetic seam (reusing the child fixture's
 recording agent); the real ``GatewayRunner`` proxy dispatch (foreground A/B/A + a background image
 handler), authenticated per-profile API keys, and the real native ``/p/<profile>/`` receiver all
-run unmodified across the two processes.
+run unmodified across the two processes. The fixture also seeds the native owner-A SessionDB
+before child startup; that proves executor continuity, not request-history forwarding/import.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -34,7 +36,9 @@ from agent import secret_scope as ss
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.proxy_admission import gateway_proxy_required
+from gateway.run import _profile_runtime_scope
 from gateway.session import build_session_key
+from hermes_state import SessionDB
 
 from tests.gateway.test_proxy_background import _RecordingAdapter, _TINY_PNG, _make_background_runner
 from tests.gateway.test_proxy_memory_identity import _client_runner, _profile_home, _source
@@ -88,11 +92,13 @@ def _read_evidence(evidence_path: Path) -> List[Dict[str, Any]]:
 
 @pytest.mark.asyncio
 async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch):
-    """Genuinely separate OS processes: the CHILD's own root policy is false (native execution
+    """Genuinely separate OS processes with seeded continuity: the CHILD's own root policy is
+    false (native execution
     permitted there) while the PARENT (this test process) pins its own root required -- proving
     the admission gate reads each process's OWN identity, never the other's, and that the
     required-proxy parent exclusively uses the configured proxy for both a foreground A/B/A and a
-    background image dispatch, never falling back to local construction."""
+    background image dispatch, never falling back to local construction. The owner-A executor
+    transcript is explicitly seeded in its native SessionDB before startup."""
     evidence_path = tmp_path / "evidence.jsonl"
 
     key_owner_a, key_owner_b = "child-owner-a-key", "child-owner-b-key"
@@ -102,6 +108,21 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
     child_root = _profile_home(tmp_path, "child-root")
     (child_root / "config.yaml").write_text(
         yaml.safe_dump({"gateway": {"proxy_required": False}}), encoding="utf-8")
+
+    authored_a1_history = [
+        {"role": "user" if index % 2 == 0 else "assistant",
+         "content": f"A1 history message {index:02d}"}
+        for index in range(20)
+    ]
+    # Seed native continuity, not a bootstrap import: the authenticated Session-ID is owned by SessionDB.
+    owner_a_db = SessionDB(db_path=home_owner_a / "state.db")
+    try:
+        owner_a_db.create_session("session-fixture", "api_server", profile_name="owner-a")
+        for message in authored_a1_history:
+            owner_a_db.append_message("session-fixture", message["role"], message["content"])
+        expected_persisted_history = owner_a_db.get_messages_as_conversation("session-fixture")
+    finally:
+        owner_a_db.close()
 
     stderr_path = tmp_path / "child-stderr.log"
     proc = _spawn_child(child_root, evidence_path, home_owner_a, home_owner_b, stderr_path)
@@ -122,7 +143,10 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         # The PARENT's own launch config (pinned, real root config.yaml): required=true.
         parent_root = _profile_home(tmp_path, "parent-root")
         (parent_root / "config.yaml").write_text(
-            yaml.safe_dump({"gateway": {"proxy_required": True}}), encoding="utf-8")
+            yaml.safe_dump({
+                "gateway": {"proxy_required": True},
+                "compression": {"enabled": True, "hygiene_hard_message_limit": 10},
+            }), encoding="utf-8")
         hermes_constants.pin_process_hermes_home(str(parent_root))
 
         profiles = {
@@ -151,8 +175,19 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         key_b = build_session_key(source, profile="owner-b")
 
         source.profile = "client-a"
+        # Keep this as a real hygiene call under the owning client profile. Required-proxy
+        # admission must preserve the exact payload rather than locally bounding it.
+        a1_history_bytes = json.dumps(authored_a1_history, ensure_ascii=False, separators=(",", ":")).encode()
+        with _profile_runtime_scope(home_client_a):
+            hygienic_a1_history = await client_runner._hmwa_run_session_hygiene(
+                SimpleNamespace(source=source), source,
+                SimpleNamespace(session_id="session-fixture"), key_a,
+                authored_a1_history, "quick-key", 1,
+            )
+        assert hygienic_a1_history is authored_a1_history
+        assert json.dumps(hygienic_a1_history, ensure_ascii=False, separators=(",", ":")).encode() == a1_history_bytes
         result_a1 = await client_runner._run_agent(
-            "current A1", "fixture system", [], source, "session-fixture", session_key=key_a)
+            "current A1", "fixture system", hygienic_a1_history, source, "session-fixture", session_key=key_a)
         source.profile = "client-b"
         result_b = await client_runner._run_agent(
             "current B", "fixture system", [], source, "session-fixture", session_key=key_b)
@@ -207,6 +242,19 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         records = _read_evidence(evidence_path)
         assert len(records) == 4, "3 foreground A/B/A + 1 background image dispatch"
         agent_a1, agent_b, agent_a2, agent_bg = records
+
+        authored_at_final_model = [
+            message for message in agent_a1["conversation_history"]
+            if message.get("role") in {"user", "assistant"}
+        ]
+        assert agent_a1["conversation_history"] == expected_persisted_history
+        assert [
+            {"role": message["role"], "content": message["content"]}
+            for message in authored_at_final_model
+        ] == authored_a1_history, (
+            "the final model seam must receive every authored history message in order and in full; "
+            "native persisted fields are compared above"
+        )
 
         child_pid = agent_a1["pid"]
         assert child_pid == proc.pid

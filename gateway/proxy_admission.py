@@ -15,6 +15,10 @@ only the require/refuse POLICY itself is pinned to the process root.
 Configuration guard, not a proxy/URL validator — it only answers whether this ordinary turn or
 ``/bg`` task may skip the remote proxy path; the exact proxy URL resolution and dispatch stay in
 ``gateway/run_turn.py::_get_proxy_url`` / ``_run_agent_via_proxy``.
+
+``admit_local_maintenance`` shares the same ``gateway_proxy_required`` read for OUT-OF-TURN session
+maintenance (auto hygiene compression, manual ``/compress``): callers recheck it across admission/
+preparation and local construction or cached-compaction boundaries.
 """
 
 from __future__ import annotations
@@ -44,6 +48,19 @@ class ApiAgentAdmissionDenied(Exception):
     def __init__(self, message: str, *, malformed: bool = False) -> None:
         super().__init__(message)
         self.malformed = malformed
+
+
+def admit_local_maintenance() -> None:
+    """Recheck ``gateway.proxy_required`` at out-of-turn admission/preparation and local
+    construction or cached-compaction boundaries. Raises ``ProxyPolicyError`` for BOTH an
+    explicit ``proxy_required: true`` and an unresolved/malformed root policy — maintenance has no
+    API-specific 403-vs-503 story, so both fail closed the same way, uniformly. Callers place
+    checks at the preparation and local execution boundaries so a late flip is caught before it
+    runs a local model."""
+    if gateway_proxy_required():
+        raise ProxyPolicyError(
+            f"{PROXY_REQUIRED_KEY} disables local out-of-turn maintenance for this process."
+        )
 
 
 def admit_local_api_agent_creation() -> None:
