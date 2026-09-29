@@ -2072,10 +2072,21 @@ class GatewayInboundMixin:
         return f"[voice message could not be transcribed automatically; the audio is available at: {agent_path}]"
 
     async def _transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audio_local_fallback) -> Tuple[Optional[str], str]:
-        """``(transcript_or_None, note)`` for one clip via configured STT with local fallback."""
-        result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
+        """``(transcript_or_None, note)`` for one clip via configured STT with local fallback.
+        The admission recheck is invoked INSIDE the worker thread, immediately before each provider
+        call — a guard placed only before the ``await`` would miss a policy flip that happens while
+        the previous provider call was still running."""
+        def _call_primary():
+            self._recheck_local_stt_admission()
+            return transcribe_audio(path, None, "gateway")
+
+        result = await asyncio.to_thread(_call_primary)
         if not result.get("success"):
-            fallback = await asyncio.to_thread(transcribe_audio_local_fallback, path)
+            def _call_fallback():
+                self._recheck_local_stt_admission()
+                return transcribe_audio_local_fallback(path)
+
+            fallback = await asyncio.to_thread(_call_fallback)
             if fallback.get("success"):
                 logger.info("Configured STT failed for %s; recovered with local STT", path)
                 result = fallback
@@ -2097,19 +2108,84 @@ class GatewayInboundMixin:
         # and made the LLM comment on voice mode instead.
         return transcript, f'"{transcript}"'
 
+    # Fixed, safe diagnostic: never claims the audio is reachable at a local listener path (that
+    # claim is only true on the process that actually holds the file) and never repeats a
+    # config/exception detail.
+    _PROXY_STT_FAILURE_NOTE = "[voice message could not be transcribed]"
+
+    def _resolve_stt_dispatch_policy(self) -> Tuple[bool, Optional[str]]:
+        """``(deny_local, proxy_url)``: a required root OR any configured proxy URL denies local
+        transcription — a configured proxy always owns STT, required or not. Raises
+        ``ProxyPolicyError`` when the root policy itself can't be confirmed safe (fails closed:
+        no local, no remote retry)."""
+        from gateway.proxy_admission import PROXY_REQUIRED_KEY, ProxyPolicyError, gateway_proxy_required
+        proxy_required = gateway_proxy_required()  # propagates ProxyPolicyError on a malformed root
+        try:
+            proxy_url = self._get_proxy_url()
+        except Exception as exc:
+            raise ProxyPolicyError(
+                f"{PROXY_REQUIRED_KEY} could not be resolved safely — refusing local voice transcription."
+            ) from exc
+        return bool(proxy_required or proxy_url), proxy_url
+
+    def _recheck_local_stt_admission(self) -> None:
+        """Fresh recheck at the actual local transcribe/fallback/duration-probe entry: a proxy
+        configured mid-loop (after the first clip already started locally) denies every remaining
+        clip rather than silently keeping the earlier all-local decision."""
+        from gateway.proxy_admission import ProxyPolicyError
+        deny_local, _ = self._resolve_stt_dispatch_policy()
+        if deny_local:
+            raise ProxyPolicyError(
+                "a proxy is now configured or required — refusing further local voice transcription."
+            )
+
     async def _enrich_message_with_transcription(
         self, user_text: str, audio_paths: List[str]
     ) -> tuple[str, List[str]]:
         """Transcribe voice clips with the configured STT provider and prepend the transcripts →
         ``(enriched_text, successful_transcripts)``; the transcripts (input order; empty if every clip
-        failed or STT is disabled) let callers echo them back before the agent loop."""
-        from gateway.run import _probe_audio_duration
+        failed or STT is disabled) let callers echo them back before the agent loop. A required root
+        or any configured proxy URL always owns STT remotely — never local, never an automatic
+        fallback — while a genuinely unconfigured, non-required root preserves the pre-existing
+        local-only behavior."""
+        from gateway.proxy_admission import ProxyPolicyError
         audio_paths = list(dict.fromkeys(audio_paths))
+        if not audio_paths:
+            return user_text, []
+
+        try:
+            deny_local, proxy_url = self._resolve_stt_dispatch_policy()
+        except ProxyPolicyError:
+            return self._prepend_media_prefix(self._PROXY_STT_FAILURE_NOTE, user_text), []
+
+        if deny_local:
+            # Disabled STT under a proxy-owned policy: no HTTP call, no local probe — a fixed
+            # neutral note (never the "voice message available at <path>" wording, which is only
+            # true on the process holding the file).
+            if not getattr(self.config, "stt_enabled", True):
+                return self._prepend_media_prefix(self._PROXY_STT_FAILURE_NOTE, user_text), []
+            if not proxy_url:
+                return self._prepend_media_prefix(self._PROXY_STT_FAILURE_NOTE, user_text), []
+            from gateway.run_voice_proxy import _enrich_message_with_transcription_via_proxy
+            return await _enrich_message_with_transcription_via_proxy(self, user_text, audio_paths, proxy_url)
+
+        from gateway.run import _probe_audio_duration
         if not getattr(self.config, "stt_enabled", True):
             notes = []
             for path in audio_paths:
+                try:
+                    self._recheck_local_stt_admission()
+                except ProxyPolicyError:
+                    notes.append(self._PROXY_STT_FAILURE_NOTE)
+                    continue
                 abs_path = os.path.abspath(path)
-                duration_str = await _probe_audio_duration(abs_path)
+                try:
+                    duration_str = await _probe_audio_duration(
+                        abs_path, admit=self._recheck_local_stt_admission,
+                    )
+                except ProxyPolicyError:
+                    notes.append(self._PROXY_STT_FAILURE_NOTE)
+                    continue
                 suffix = f" (duration: {duration_str})" if duration_str else ""
                 notes.append(f"[The user sent a voice message: {abs_path}{suffix}]")
             return (self._prepend_media_prefix("\n\n".join(notes), user_text) if notes else user_text), []
@@ -2126,6 +2202,7 @@ class GatewayInboundMixin:
         successful_transcripts: List[str] = []
         for path in audio_paths:
             try:
+                self._recheck_local_stt_admission()
                 logger.debug("Transcribing user voice: %s", path)
                 transcript, note = await self._transcribe_one_clip(
                     path, transcribe_audio, transcribe_audio_local_fallback,
@@ -2133,6 +2210,8 @@ class GatewayInboundMixin:
                 if transcript is not None:
                     successful_transcripts.append(transcript)
                 enriched_parts.append(note)
+            except ProxyPolicyError:
+                enriched_parts.append(self._PROXY_STT_FAILURE_NOTE)
             except Exception as e:
                 logger.error("Transcription error: %s", e)
                 enriched_parts.append(self._untranscribed_audio_note(path))
@@ -2153,14 +2232,18 @@ class GatewayInboundMixin:
         self, event, user_text: Optional[str] = None
     ) -> tuple[str | None, List[str]]:
         """Transcribe a pending audio event once and cache the result on the event: the interrupt
-        monitor and the pending-drain path both need it — one STT call and one echo per message."""
+        monitor and the pending-drain path both need it — one STT call and one echo per message.
+        Unlike the ordinary inbound path (already scoped by its caller), this is reached from the
+        clarify/pending-drain and busy-interrupt paths with no scope guaranteed yet, so it binds
+        the event's OWN source scope itself before resolving the proxy URL/key."""
         if hasattr(event, "_gateway_pending_stt_text"):
             return event._gateway_pending_stt_text, list(getattr(event, "_gateway_pending_stt_transcripts", []) or [])
         audio_paths = self._pending_event_audio_paths(event)
         if not audio_paths:
             return user_text if user_text is not None else (getattr(event, "text", None) or None), []
         text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
+        async with self._async_profile_scope_for_source(event.source):
+            enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
         event._gateway_pending_stt_text = enriched_text
         event._gateway_pending_stt_transcripts = list(successful_transcripts)
         return enriched_text, successful_transcripts

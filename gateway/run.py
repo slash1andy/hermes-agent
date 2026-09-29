@@ -2572,28 +2572,43 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-async def _probe_audio_duration(path: str) -> Optional[str]:
-    """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure."""
+async def _probe_audio_duration(path: str, *, admit: Optional[Callable[[], None]] = None) -> Optional[str]:
+    """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure.
+    ``admit`` (when given) is rechecked at the actual wav/ogg worker-thread entry and again
+    immediately before the ffprobe subprocess call — a late policy flip (e.g. a proxy becoming
+    required mid-probe) must deny the remaining local attempts instead of silently falling through
+    to ffprobe. Its typed ``ProxyPolicyError`` always escapes this function's own failure handling."""
+    from gateway.proxy_admission import ProxyPolicyError
     ext = os.path.splitext(path)[1].lower()
     if ext == ".wav":
         try:
             def _wav_duration() -> float:
+                if admit is not None:
+                    admit()
                 import wave
                 with wave.open(path, "rb") as wf:
                     frames = wf.getnframes()
                     rate = wf.getframerate() or 1
                     return frames / float(rate)
             return _format_duration(await asyncio.to_thread(_wav_duration))
+        except ProxyPolicyError:
+            raise
         except Exception:
             pass
     if ext in (".ogg", ".opus", ".oga"):
         try:
             def _ogg_duration() -> float:
+                if admit is not None:
+                    admit()
                 from mutagen.oggopus import OggOpus
                 return float(OggOpus(path).info.length)
             return _format_duration(await asyncio.to_thread(_ogg_duration))
+        except ProxyPolicyError:
+            raise
         except Exception:
             pass
+    if admit is not None:
+        admit()
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -3393,7 +3408,8 @@ class GatewayRunner(
     GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin,
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
-    GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
+    GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin,
+    GatewayGoalsMixin,
     GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 

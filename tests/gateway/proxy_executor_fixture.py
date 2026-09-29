@@ -41,14 +41,57 @@ def _append_evidence(evidence_path: Path, record: Dict[str, Any]) -> None:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _install_stt_synthetic_seam(evidence_path: Path) -> None:
+    """Patch ONLY the final ``tools.transcription_tools`` provider seam: the real multipart parse,
+    auth, profile-prefix middleware, worker-thread lifecycle and temp-file handling in
+    ``gateway/platforms/api_server_audio.py`` all run unmodified. ``transcribe_audio`` becomes a
+    deterministic function of the exact uploaded bytes (sha256-derived, never a fixed string) so a
+    caller can independently compute the expected transcript without sharing state with this
+    process; ``transcribe_audio_local_fallback`` becomes a hard failure so a caller can prove the
+    receiver never silently recovers via the local-fallback seam for its own construction."""
+    import hashlib
+    import base64
+    import tools.transcription_tools as transcription_tools
+    from gateway.platforms._shared import get_scoped_secret
+    from gateway.proxy_admission import gateway_proxy_required
+    from hermes_constants import get_hermes_home
+
+    def _synthetic_transcribe_audio(file_path, model=None, source=None):
+        data = Path(file_path).read_bytes()
+        transcript = f"synthetic-transcript:{hashlib.sha256(data).hexdigest()[:16]}"
+        _append_evidence(evidence_path, {
+            "kind": "stt",
+            "pid": os.getpid(),
+            "home": str(get_hermes_home()),
+            "bytes_b64": base64.b64encode(data).decode("ascii"),
+            "stt_test_marker": get_scoped_secret("STT_TEST_MARKER"),
+            "own_proxy_required": gateway_proxy_required(),
+            "model": model,
+            "source": source,
+        })
+        return {"success": True, "transcript": transcript, "provider": "synthetic-child-stt"}
+
+    def _forbidden_local_fallback(file_path, model=None):
+        raise AssertionError(
+            "child transcribe_audio_local_fallback must never run: only the final provider "
+            "seam is a labelled synthetic here"
+        )
+
+    transcription_tools.transcribe_audio = _synthetic_transcribe_audio
+    transcription_tools.transcribe_audio_local_fallback = _forbidden_local_fallback
+
+
 def _install_synthetic_seam(evidence_path: Path) -> None:
-    """Patch ONLY the final model/provider resolution and ``AIAgent`` construction/execution;
-    auth, profile-prefix middleware and the real ``_create_agent`` body stay untouched."""
+    """Patch ONLY the final model/provider resolution and ``AIAgent`` construction/execution, plus
+    the final STT provider seam (see ``_install_stt_synthetic_seam``); auth, profile-prefix
+    middleware and the real ``_create_agent``/audio-receiver bodies stay untouched."""
     import run_agent
     import gateway.run as gateway_run
     import hermes_cli.tools_config as tools_config
     from hermes_constants import get_hermes_home, get_process_hermes_home
     from gateway.proxy_admission import gateway_proxy_required
+
+    _install_stt_synthetic_seam(evidence_path)
 
     class _ChildRecordingAIAgent:
         def __init__(self, **kwargs):
