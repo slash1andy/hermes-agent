@@ -10,7 +10,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner, _profile_runtime_scope
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 
 
 @asynccontextmanager
@@ -66,7 +66,9 @@ def _scope(home, url, key):
 
 @pytest.mark.asyncio
 async def test_profile_proxy_routes_a_b_a_with_scoped_auth_and_restoration(tmp_path, monkeypatch):
-    """The real gateway dispatch changes proxy URL/key with each bound profile scope."""
+    """The real gateway dispatch changes proxy URL/key with each bound profile scope, and forwards
+    each owner's native ``build_session_key`` conversation identity unchanged, independently of the
+    rotating transcript ``X-Hermes-Session-Id``."""
     import run_agent
 
     def no_local_inference(*args, **kwargs):
@@ -77,6 +79,11 @@ async def test_profile_proxy_routes_a_b_a_with_scoped_auth_and_restoration(tmp_p
     source = _source()
     home_a, home_b = tmp_path / "a", tmp_path / "b"
     home_a.mkdir(); home_b.mkdir()
+    # Distinct native profile-qualified conversation keys for the SAME source: proves the header
+    # carries the per-owner memory identity, not something derived from source/session_id alone.
+    key_a = build_session_key(source, profile="owner-a")
+    key_b = build_session_key(source, profile="owner-b")
+    assert key_a != key_b
 
     async with _server(response="fixture A") as (url_a, requests_a):
         async with _server(response="fixture B") as (url_b, requests_b):
@@ -84,30 +91,54 @@ async def test_profile_proxy_routes_a_b_a_with_scoped_auth_and_restoration(tmp_p
 
             with _scope(home_a, url_a, "synthetic-key-A"):
                 result_a1 = await runner._run_agent(
-                    "current A1", "fixture system", [], source, "session-fixture"
+                    "current A1", "fixture system", [], source, "session-fixture", session_key=key_a,
                 )
                 with _scope(home_b, url_b, "synthetic-key-B"):
                     result_b = await runner._run_agent(
-                        "current B", "fixture system", [], source, "session-fixture"
+                        "current B", "fixture system", [], source, "session-fixture", session_key=key_b,
                     )
                     assert get_secret("GATEWAY_PROXY_KEY") == "synthetic-key-B"
                 assert get_secret("GATEWAY_PROXY_KEY") == "synthetic-key-A"
                 result_a2 = await runner._run_agent(
-                    "current A2", "fixture system", [], source, "session-fixture"
+                    "current A2", "fixture system", [], source, "session-fixture-next", session_key=key_a,
                 )
             results = [result_a1, result_b, result_a2]
 
     assert [result["final_response"] for result in results] == ["fixture A", "fixture B", "fixture A"]
     assert [item[0] for item in requests_a] == ["/v1/chat/completions", "/v1/chat/completions"]
     assert [item[0] for item in requests_b] == ["/v1/chat/completions"]
-    for requests, key, messages in (
-        (requests_a, "synthetic-key-A", ["current A1", "current A2"]),
-        (requests_b, "synthetic-key-B", ["current B"]),
+    for requests, key, session_key, messages, session_ids in (
+        (requests_a, "synthetic-key-A", key_a, ["current A1", "current A2"],
+         ["session-fixture", "session-fixture-next"]),
+        (requests_b, "synthetic-key-B", key_b, ["current B"], ["session-fixture"]),
     ):
-        for (_, headers, body), message in zip(requests, messages):
+        for (_, headers, body), message, expected_session_id in zip(requests, messages, session_ids):
             assert headers["Authorization"] == f"Bearer {key}"
-            assert headers["X-Hermes-Session-Id"] == "session-fixture"
+            # Transcript identity may rotate independently of the owner-qualified memory key.
+            assert headers["X-Hermes-Session-Id"] == expected_session_id
+            assert headers["X-Hermes-Session-Key"] == session_key
             assert body["messages"][-1] == {"role": "user", "content": message}
+
+
+@pytest.mark.asyncio
+async def test_profile_proxy_omits_session_key_header_when_absent(tmp_path):
+    """Absent-key compatibility control: a caller that supplies no ``session_key`` must not have the
+    gateway invent or coarsen one — ``X-Hermes-Session-Key`` stays absent from the outbound request."""
+    runner = _runner()
+    source = _source()
+    home = tmp_path / "profile"
+    home.mkdir()
+
+    async with _server(response="fixture no-key") as (url, requests):
+        with _scope(home, url, "synthetic-key"):
+            result = await runner._run_agent(
+                "current", "fixture system", [], source, "session-no-key",
+            )
+
+    assert result["final_response"] == "fixture no-key"
+    assert len(requests) == 1
+    _, headers, _ = requests[0]
+    assert "X-Hermes-Session-Key" not in headers
 
 
 @pytest.mark.asyncio

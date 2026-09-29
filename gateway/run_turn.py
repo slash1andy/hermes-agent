@@ -2807,6 +2807,8 @@ class GatewayTurnMixin:
             headers["Authorization"] = f"Bearer {proxy_key}"
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
+        if session_key:
+            headers["X-Hermes-Session-Key"] = session_key
         body = {"model": "hermes-agent", "messages": api_messages, "stream": True}
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
