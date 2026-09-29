@@ -591,6 +591,18 @@ error. A delivery failure does not count toward the job's `failure_streak`
 (the agent did its job); the next fully successful run returns the status to
 `ok`.
 
+A restart-safe external cron worker hands its send to the durable native delivery queue and
+waits for a gateway to process it. That wait can end without a proven send: the row may still be
+queued for the next gateway, or a claiming gateway may have exited mid-send with the outcome never
+confirmed. These are recorded as `last_status: delivery_queued` / `delivery_unknown` (never
+`delivery_failed` — the message may already be on its way, or already delivered) with the queue's
+own disposition (`queued`/`unknown`/`delivered`/`failed`) mirrored in `last_delivery_outcome` and
+the execution's ledger `delivery_outcome`. An `unknown` outcome is never resent automatically and
+is never shown as a definitive failure — `hermes cron list`/`doctor` and a manual run's summary
+call it out as unconfirmed instead. A model failure keeps its own `last_status: error` and
+`last_error` regardless of the delivery outcome; `last_delivery_outcome` records the delivery
+uncertainty alongside it rather than overwriting it.
+
 ### Bot Chat delivery (`bot-chat`)
 
 `bot-chat` delivers the output **into a profile's canonical "Bot Chat" session as a real message**. Unlike every other target — where the recipient is a human reading a channel — the recipient here is the bot itself: it receives the output as an incoming message, acts on anything that needs action, and responds in its chat. Use it when scheduled output should be *processed*, not just posted.

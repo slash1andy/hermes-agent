@@ -2292,10 +2292,16 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
 
 def _record_run_outcome(
     job: Dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
-    status: Optional[str], now: str,
+    status: Optional[str], now: str, delivery_outcome: Optional[str] = None,
 ) -> None:
-    """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
+    """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims.
+
+    ``delivery_outcome`` is the native delivery queue's typed disposition ("queued"/"unknown"/
+    "delivered"/"failed") when the run's delivery actually went through that queue, else None —
+    always written (clearing any stale prior value) so it never lingers from an earlier run.
+    """
     job["last_run_at"] = now
+    job["last_delivery_outcome"] = delivery_outcome
     job.pop("manual_run_at", None)
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)
@@ -2378,6 +2384,7 @@ def mark_job_run(
     expected_fire_owner: Optional[str] = None,
     model_unreachable: bool = False,
     quota_hold_seconds: Optional[float] = None,
+    delivery_outcome: Optional[str] = None,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -2386,6 +2393,12 @@ def mark_job_run(
     ``last_status = "delivery_failed"`` (never "ok") while ``failure_streak`` is left alone. An
     explicit ``status`` (e.g. "blocked_config") overrides the derived value. False when the fence
     can't be taken, the job is missing, or ``expected_fire_owner`` no longer holds the fire claim.
+
+    ``delivery_outcome``: the native delivery queue's typed disposition for this run
+    ("queued"/"unknown"/"delivered"/"failed"), stored as ``last_delivery_outcome`` alongside
+    ``last_status``/``last_error`` so a model failure and an uncertain delivery can be recorded
+    together. Omitted (None) for any run whose delivery did not go through that queue, which
+    clears a stale value left by an earlier run.
 
     ``model_unreachable``: this failed run never reached the model (transient network/DNS error,
     zero API calls). Recurring jobs then get a bounded automatic re-run — ``next_run_at`` is pulled
@@ -2405,7 +2418,7 @@ def mark_job_run(
                     job_id)
                 return False
         now = _hermes_now().isoformat()
-        _record_run_outcome(job, success, error, delivery_error, status, now)
+        _record_run_outcome(job, success, error, delivery_error, status, now, delivery_outcome)
         _advance_after_run(job, now)
         from cron import quota_hold
         from cron.unreachable_retry import clear_state, plan_retry

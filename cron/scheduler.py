@@ -2829,9 +2829,16 @@ def _classify_delivery_outcome(
     *, delivery_error, should_deliver: bool, unresolved_origin: bool,
     normalized_deliver: str, incident_acked: bool, success: bool,
     delivery_queued=None, notification_suppressed: bool = False,
+    native_queue_outcome: Optional[str] = None,
 ) -> str:
+    # The native delivery queue's own typed disposition is authoritative over a generic
+    # delivery_error string: an unresolved send is neither a proven failure nor silence.
+    if native_queue_outcome == "unknown":
+        return "unknown"
     if delivery_error:
         return "failed"
+    if native_queue_outcome == "queued":
+        return "queued"
     if should_deliver and delivery_queued:
         return "queued"
     if notification_suppressed:
@@ -2962,6 +2969,9 @@ class _RunDelivery:
     error: Optional[str]
     delivery_attempted: bool = False
     delivery_error: Optional[str] = None
+    # Native delivery queue's typed disposition ("queued"/"unknown"/"delivered"/"failed") when
+    # this run's delivery went through that queue; None otherwise.
+    native_queue_outcome: Optional[str] = None
     should_deliver: bool = False
     unresolved_origin: bool = False
     blocked_config: bool = False
@@ -3049,6 +3059,7 @@ def _save_compose_deliver(
                 # on the failure path) honor the job's failure_deliver override (NS-788).
                 for_failure=not d.success,
             )
+            d.native_queue_outcome = job.pop("_native_queue_status", None)
     except Exception as de:
         if isinstance(de, _FireClaimLostDuringSideEffect):
             raise
@@ -3094,6 +3105,15 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         mark_kwargs["quota_hold_seconds"] = _hold_s
     if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
         mark_kwargs["status"] = "delivery_queued"
+    # A model failure keeps last_status="error" regardless of delivery outcome (retains the real
+    # model error); the native queue's typed status only overrides last_status on a successful run.
+    if d.success:
+        if d.native_queue_outcome == "queued":
+            mark_kwargs["status"] = "delivery_queued"
+        elif d.native_queue_outcome == "unknown":
+            mark_kwargs["status"] = "delivery_unknown"
+    if d.native_queue_outcome is not None:
+        mark_kwargs["delivery_outcome"] = d.native_queue_outcome
     if fire_owner is not None:
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
@@ -3116,6 +3136,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)),
         incident_acked=d.incident_acked,
         success=d.success,
+        native_queue_outcome=d.native_queue_outcome,
     )
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
@@ -3127,14 +3148,16 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
 
 def _deliver_crash_failure(
     job: dict, err_text: str, *, adapters, loop,
-) -> tuple[Optional[str], str]:
-    """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
+) -> tuple[Optional[str], str, Optional[str]]:
+    """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome,
+    native_queue_outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
-        return None, "suppressed_acked"
+        return None, "suppressed_acked", None
     delivery_error = None
+    native_queue_outcome = None
     try:
         delivery_error = _deliver_result(
             job,
@@ -3145,6 +3168,7 @@ def _deliver_crash_failure(
             loop=loop,
             for_failure=True,
         )
+        native_queue_outcome = job.pop("_native_queue_status", None)
     except Exception as delivery_exc:
         delivery_error = str(delivery_exc)
         logger.error("Delivery failed for job %s: %s", job["id"], delivery_exc)
@@ -3157,10 +3181,11 @@ def _deliver_crash_failure(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"),
-        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
+        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
+        native_queue_outcome=native_queue_outcome)
     if delivery_outcome in ("delivered", "not_configured"):
         _mark_incident_alerted(failure_incident_id)
-    return delivery_error, delivery_outcome
+    return delivery_error, delivery_outcome, native_queue_outcome
 
 
 
@@ -3348,6 +3373,7 @@ def _run_one_job_body(
             _err_text,
             exc_info=(type(e), e, e.__traceback__))
         delivery_outcome = "suppressed"
+        native_queue_outcome = None
         # Owner fencing: a stale worker whose claim was taken over (or transport-cancelled) must not
         # send a failure alert on top of the replacement run's; fall through to fenced bookkeeping.
         if (
@@ -3356,7 +3382,7 @@ def _run_one_job_body(
             and not isinstance(e, _FireClaimLostDuringSideEffect)
             and not _fire_claim_ownership_lost()
         ):
-            delivery_error, delivery_outcome = _deliver_crash_failure(
+            delivery_error, delivery_outcome, native_queue_outcome = _deliver_crash_failure(
                 job, _err_text, adapters=adapters, loop=loop)
         try:
             if (
@@ -3368,6 +3394,8 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if isinstance(e, Exception):
                     mark_kwargs["delivery_error"] = delivery_error
+                    if native_queue_outcome is not None:
+                        mark_kwargs["delivery_outcome"] = native_queue_outcome
                 mark_job_run(job["id"], False, _err_text, **mark_kwargs)
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.

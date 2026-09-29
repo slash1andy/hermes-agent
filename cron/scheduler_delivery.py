@@ -1989,6 +1989,7 @@ def _deliver_result(
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
     job.pop("_delivery_outcome_unknown", None)
+    job.pop("_native_queue_status", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
         _record_delivery_verification(job, [])
@@ -2007,10 +2008,32 @@ def _deliver_result(
 
         _record_delivery_verification(job, [])
         error = enqueue_and_wait(external_execution, job, content, for_failure=for_failure)
+        # Read the queue's own terminal status AFTER the wait — the authoritative outcome,
+        # not a parse of the error string. `error` above reflects whatever the wait last
+        # observed; the row can settle to a DIFFERENT disposition between that check and this
+        # one (drain races, a claim finishing right as the wait times out). Reconcile `error`
+        # from THIS SAME `get_status` read so the returned error, the native-queue outcome and
+        # the eventual job/ledger status can never disagree with each other.
         from cron.delivery_queue import get_status
         delivery_status = get_status(external_execution)
-        if delivery_status and delivery_status["status"] == "suppressed":
-            job["_notification_all_targets_suppressed"] = True
+        if delivery_status:
+            status = delivery_status["status"]
+            if status == "suppressed":
+                job["_notification_all_targets_suppressed"] = True
+            if status in ("pending", "delivering"):
+                # Never claimed a terminal outcome — left queued for the next gateway, not a
+                # native-queue failure or Bot Chat's own `last_delivery_queued`.
+                job["_native_queue_status"] = "queued"
+                error = None
+            elif status in ("delivered", "suppressed"):
+                job["_native_queue_status"] = status
+                error = None
+            else:
+                # "unknown"/"failed" (or any future terminal disposition): must carry a
+                # nonempty error — same fixed fallback shape delivery_queue itself uses when a
+                # row's own error is absent, never invented text.
+                job["_native_queue_status"] = status
+                error = str(delivery_status.get("error") or f"delivery {status}")
         from cron.jobs import get_job
         refreshed = get_job(job["id"]) or {}
         job["last_delivery_queued"] = refreshed.get("last_delivery_queued")

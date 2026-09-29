@@ -168,6 +168,14 @@ def _manual_run_delivery_note(deliver: str, refreshed: Dict[str, Any]) -> str:
     # locally. Whitespace-only values fall through so the fire-time "no target" error surfaces.
     if not deliver or deliver == "local":
         return " (output saved locally only)"
+    # The native delivery queue's own typed disposition, when this run used it, is authoritative
+    # over `last_delivery_error` text — "unknown" is genuinely uncertain, never a proven failure.
+    native_outcome = refreshed.get("last_delivery_outcome")
+    if native_outcome == "unknown":
+        detail = str(refreshed.get("last_delivery_error") or "").strip()[:200] or "no details"
+        return f" (delivery outcome unknown/unconfirmed: {detail}; do not resend)"
+    if native_outcome == "queued":
+        return " (delivery still queued/in progress; completion unverified, do not resend)"
     err = str(refreshed.get("last_delivery_error") or "").strip()
     if not err:
         if refreshed.get("last_delivery_queued"):
@@ -318,6 +326,13 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
         run_error = refreshed.get("last_error")
         if last_status == "delivery_failed" and not run_error:
             run_error = refreshed.get("last_delivery_error")
+        elif last_status == "delivery_unknown" and not run_error:
+            # Distinct from a proven delivery failure: the model succeeded but the native queue
+            # never confirmed the send. A bare success=False with error=None reads as an
+            # unexplained failure, so this always carries a meaningful explanation.
+            run_error = (
+                refreshed.get("last_delivery_error")
+                or "delivery outcome unknown/unconfirmed; do not resend")
         # That is NOT a success for the caller — the calling agent relays this result — so report it as
         # failed and surface the delivery error, which lives in last_delivery_error (last_error is None for
         # these runs, and a bare success=False with error=None reads as an unexplained failure). See #83993.
@@ -427,9 +442,16 @@ def _manual_run_completion(
     """Async-delegation completion block for a finished background manual run."""
     duration = round(time.time() - started_at, 2)
     refreshed = get_job(job_id) or {}
+    last_status = refreshed.get("last_status")
+    if last_status == "delivery_queued":
+        result_label = "run completed; delivery queued/in progress"
+    elif last_status == "delivery_unknown":
+        result_label = "run completed; delivery unknown/unconfirmed"
+    else:
+        result_label = "ok" if res.get("success") else "FAILED"
     lines = [
         f"Cron job '{job_name}' ({job_id}) finished its manual run.",
-        f"Result: {'ok' if res.get('success') else 'FAILED'}"
+        f"Result: {result_label}"
         + (f" — {res.get('error')}" if res.get("error") else ""),
         f"Delivery target: {deliver}" + _manual_run_delivery_note(deliver, refreshed),
     ]
