@@ -1453,15 +1453,46 @@ class GatewayInboundMixin:
                 video_paths.append(path)
         return image_paths, audio_paths, audio_file_paths, video_paths
 
+    def _admit_local_image_preparation(self) -> None:
+        """Reject local image preparation when proxy forwarding must handle images."""
+        from gateway.proxy_admission import PROXY_REQUIRED_KEY, ProxyPolicyError, gateway_proxy_required
+
+        proxy_required = gateway_proxy_required()  # propagates ProxyPolicyError on a malformed root
+        try:
+            proxy_url = proxy_required or self._get_proxy_url()
+        except Exception as exc:
+            raise ProxyPolicyError(
+                f"{PROXY_REQUIRED_KEY} could not be resolved safely — refusing local image preparation."
+            ) from exc
+        if proxy_url:
+            raise ProxyPolicyError(
+                f"{PROXY_REQUIRED_KEY} or a configured proxy disables local image preparation "
+                "for this process."
+            )
+
+    def _deny_local_image_preparation(
+        self, session_key: Optional[str], message_text: str, image_paths: list[str]
+    ) -> str:
+        """Preserve original images for native proxy dispatch after local preparation is denied."""
+        self._session_state(session_key).persistent.native_image_paths = list(image_paths)
+        return message_text
+
     async def _enrich_inbound_images(
         self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str]
     ) -> str:
         """Route images natively (attach pixels at run_conversation) or pre-analyze them into text."""
-        # See agent/image_routing.py. Offloaded to a thread: the decision does blocking network I/O
-        # (models.dev fetch on cache miss, Ollama /api/show probe) that would stall the event loop.
-        _img_mode = await asyncio.to_thread(
-            self._decide_image_input_mode, source=source, session_key=session_key,
-        )
+        from gateway.proxy_admission import ProxyPolicyError
+
+        try:
+            self._admit_local_image_preparation()
+            # See agent/image_routing.py; this may do blocking I/O.
+            _img_mode = await asyncio.to_thread(
+                self._decide_image_input_mode, source=source, session_key=session_key,
+            )
+            self._admit_local_image_preparation()
+        except ProxyPolicyError:
+            return self._deny_local_image_preparation(session_key, message_text, image_paths)
+
         if _img_mode == "native":
             self._session_state(session_key).persistent.native_image_paths = list(image_paths)
             logger.info(
@@ -1487,7 +1518,12 @@ class GatewayInboundMixin:
         from agent.auxiliary_client import scoped_runtime_main
 
         with scoped_runtime_main(vision_runtime):
-            return await self._enrich_message_with_vision(message_text, image_paths)
+            try:
+                return await self._enrich_message_with_vision(message_text, image_paths)
+            except ProxyPolicyError:
+                # Discard any descriptions already produced for earlier images in this call —
+                # a late per-image denial must not persist as a fabricated partial analysis.
+                return self._deny_local_image_preparation(session_key, message_text, image_paths)
 
     async def _echo_stt_transcripts(
         self, adapter, source: SessionSource, transcripts: List[str], *, metadata=None, log_context: str = "Transcript"
@@ -1932,6 +1968,7 @@ class GatewayInboundMixin:
         (see agent/image_routing.py). Sessions can carry /model overrides and this runs before AIAgent
         sets the auxiliary_client runtime globals, so resolve the per-session runtime bundle the
         upcoming turn will use, not just the persisted default."""
+        self._admit_local_image_preparation()
         try:
             from agent.image_routing import decide_image_input_mode
             from agent.auxiliary_client import _read_main_model, _read_main_provider
@@ -1984,6 +2021,10 @@ class GatewayInboundMixin:
         )
         enriched_parts = []
         for path in image_paths:
+            # Recheck at the actual vision-tool invocation, per image, OUTSIDE the try/except
+            # below: a late admission denial must raise the typed ``ProxyPolicyError`` to the
+            # caller, never be laundered into a generic-failure note by the broad catch.
+            self._admit_local_image_preparation()
             try:
                 logger.debug("Auto-analyzing user image: %s", path)
                 result = json.loads(await vision_analyze_tool(image_url=path, user_prompt=analysis_prompt))
