@@ -20,12 +20,15 @@ POSIX-only: Windows has its own grandchild lifecycle (no shared session,
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -431,3 +434,291 @@ def test_explicit_k_wins_over_node_id_inference(tmp_path: Path) -> None:
     # -k test_beta wins: one test ran, and it wasn't filtered to nothing.
     assert proc.returncode == 0, proc.stdout
     assert "1 tests passed" in proc.stdout
+
+
+# ── Duration-aware timeout scaling, retry eligibility, cold-cache gate ───────
+#
+# These are fast, deterministic unit tests against the runner module's
+# internals (loaded directly, not via subprocess) rather than integration
+# tests over real multi-minute pytest files. Each loads its own fresh copy
+# of the module so module-level state (``_FLAKY_RESULTS``) never leaks
+# between tests.
+#
+# Context: a known-large test file (e.g. tests/test_hermes_state.py, ~435
+# tests) passes in ~113-115s solo but can be SIGKILL'd under a cold-cache,
+# multi-worker run before that — the flat --file-timeout cap has no notion
+# of "this file is normally slow", and the automatic flake-retry then
+# quietly reruns (and passes) a file that was never actually broken,
+# manufacturing a green FLAKY result instead of surfacing the real risk.
+
+
+def _load_runner_module():
+    """Import scripts/run_tests_parallel.py as a fresh, isolated module."""
+    repo_root = Path(__file__).resolve().parent.parent
+    path = repo_root / "scripts" / "run_tests_parallel.py"
+    spec = importlib.util.spec_from_file_location(
+        "run_tests_parallel_under_test", path
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_effective_timeout_floor_when_uncached_or_zero() -> None:
+    """No cache entry (or a 0.0 entry, which can't be a real run) keeps the flat cap."""
+    mod = _load_runner_module()
+    repo_root = Path(__file__).resolve().parent.parent
+    f = repo_root / "tests" / "test_example_uncached.py"
+    assert mod._effective_file_timeout(f, repo_root, 300.0, None) == 300.0
+    assert mod._effective_file_timeout(f, repo_root, 300.0, {}) == 300.0
+    zero_cached = {mod._format_file(f, repo_root): 0.0}
+    assert mod._effective_file_timeout(f, repo_root, 300.0, zero_cached) == 300.0
+
+
+def test_effective_timeout_headroom_and_floor() -> None:
+    """3x a slow file's cached duration wins; a fast file's 3x stays under the cap."""
+    mod = _load_runner_module()
+    repo_root = Path(__file__).resolve().parent.parent
+    slow = repo_root / "tests" / "test_example_slow.py"
+    durations = {mod._format_file(slow, repo_root): 115.0}
+    # 115s observed (matches the tests/test_hermes_state.py-style evidence)
+    # -> 345s bound: headroom over the flat 300s cap.
+    assert mod._effective_file_timeout(slow, repo_root, 300.0, durations) == 345.0
+
+    fast = repo_root / "tests" / "test_example_fast.py"
+    fast_durations = {mod._format_file(fast, repo_root): 4.0}
+    # 4s * 3 = 12s, well under the flat cap -> the flat cap is the floor.
+    assert mod._effective_file_timeout(fast, repo_root, 300.0, fast_durations) == 300.0
+
+
+def test_clean_pass_durations_excludes_failed_and_flaky() -> None:
+    """Only a first-attempt-clean duration feeds the cache.
+
+    A timed-out (SIGKILL'd) or retry-healed (FLAKY) file must not inflate
+    its own future timeout budget — see _clean_pass_durations.
+    """
+    mod = _load_runner_module()
+    repo_root = Path(__file__).resolve().parent.parent
+    clean = repo_root / "tests" / "test_example_clean.py"
+    timed_out = repo_root / "tests" / "test_example_timed_out.py"
+    flaky_file = repo_root / "tests" / "test_example_flaky.py"
+    file_times = [(clean, 12.0), (timed_out, 300.4), (flaky_file, 250.0)]
+    failures = [(timed_out, "(300s exceeded; process tree SIGKILL'd)", {})]
+    flaky = [(flaky_file, "⚠ FLAKY: failed on attempt 1, passed on retry")]
+
+    kept = mod._clean_pass_durations(file_times, failures, flaky)
+
+    assert kept == [(clean, 12.0)]
+
+
+def test_timeout_rc_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """rc 124 (this runner's SIGKILL-on-timeout convention) is never retried."""
+    mod = _load_runner_module()
+    calls: list[float] = []
+
+    def fake_once(file, pytest_args, repo_root, file_timeout):
+        calls.append(file_timeout)
+        return file, 124, "(300s exceeded; process tree SIGKILL'd)", {}, 300.0
+
+    monkeypatch.setattr(mod, "_run_one_file_once", fake_once)
+    _file, rc, _output, _summary, _wall = mod._run_one_file(
+        Path("tests/test_would_be_slow.py"), [], Path("."), 300.0, retries=1
+    )
+
+    assert rc == 124
+    assert len(calls) == 1, "timed-out file must not be retried"
+
+
+def test_signal_killed_rc_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A negative (signal-killed) rc is never retried either."""
+    mod = _load_runner_module()
+    calls: list[int] = []
+
+    def fake_once(file, pytest_args, repo_root, file_timeout):
+        calls.append(1)
+        return file, -9, "killed by signal 9", {}, 5.0
+
+    monkeypatch.setattr(mod, "_run_one_file_once", fake_once)
+    _file, rc, _output, _summary, _wall = mod._run_one_file(
+        Path("tests/test_would_be_oom_killed.py"), [], Path("."), 300.0, retries=1
+    )
+
+    assert rc == -9
+    assert len(calls) == 1, "signal-killed file must not be retried"
+
+
+def test_ordinary_failure_still_retries_and_reports_flaky(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An everyday nonzero pytest exit keeps the existing retry + FLAKY behavior."""
+    mod = _load_runner_module()
+    calls: list[int] = []
+
+    def fake_once(file, pytest_args, repo_root, file_timeout):
+        calls.append(1)
+        if len(calls) == 1:
+            return file, 1, "assertion failed", {"failed": 1}, 1.0
+        return file, 0, "passed on retry", {"passed": 1}, 1.0
+
+    monkeypatch.setattr(mod, "_run_one_file_once", fake_once)
+    _file, rc, output, _summary, _wall = mod._run_one_file(
+        Path("tests/test_would_be_flaky.py"), [], Path("."), 300.0, retries=1
+    )
+
+    assert rc == 0
+    assert len(calls) == 2, "ordinary nonzero exits remain retry-eligible"
+    assert "FLAKY" in output
+
+
+def test_is_large_file_threshold() -> None:
+    mod = _load_runner_module()
+    counts = {
+        Path("a.py"): mod._LARGE_FILE_TEST_COUNT_THRESHOLD - 1,
+        Path("b.py"): mod._LARGE_FILE_TEST_COUNT_THRESHOLD,
+        Path("c.py"): mod._LARGE_FILE_TEST_COUNT_THRESHOLD + 100,
+    }
+    assert mod._is_large_file(Path("a.py"), counts) is False
+    assert mod._is_large_file(Path("b.py"), counts) is True
+    assert mod._is_large_file(Path("c.py"), counts) is True
+    assert mod._is_large_file(Path("missing.py"), counts) is False
+
+
+def test_large_file_gate_serializes_large_files_leaves_normal_files_ungated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At most one large file runs at a time; normal (ungated) files never wait on it.
+
+    Uses threading.Event handoffs (not sleeps) so the ordering is asserted
+    deterministically: the 2nd/3rd large file must NOT have started while
+    the 1st still holds the gate, and normal files complete immediately
+    regardless of the gate's state. The "second/third large file hasn't
+    started yet" check itself is a handoff on a second Event set by a
+    watcher thread that blocks on the semaphore, rather than a sleep-and-hope
+    window — see ``blocked_on_gate`` below.
+    """
+    mod = _load_runner_module()
+    gate = threading.Semaphore(1)
+
+    large_files = [Path(f"tests/test_large_{i}.py") for i in range(3)]
+    normal_files = [Path(f"tests/test_normal_{i}.py") for i in range(2)]
+
+    concurrent_large = 0
+    max_concurrent_large = 0
+    lock = threading.Lock()
+    entered = {f: threading.Event() for f in large_files}
+    release = {f: threading.Event() for f in large_files}
+
+    def fake_run_one_file(file, pytest_args, repo_root, file_timeout, retries):
+        nonlocal concurrent_large, max_concurrent_large
+        if file not in entered:
+            # Normal file: no synchronization — must return immediately.
+            return file, 0, "", {}, 0.0
+        with lock:
+            concurrent_large += 1
+            max_concurrent_large = max(max_concurrent_large, concurrent_large)
+        entered[file].set()
+        held = release[file].wait(timeout=5)
+        with lock:
+            concurrent_large -= 1
+        assert held, f"{file} was never released — test deadlocked"
+        return file, 0, "", {}, 0.0
+
+    monkeypatch.setattr(mod, "_run_one_file", fake_run_one_file)
+
+    # No thread involved: a non-blocking acquire on the SAME semaphore
+    # either succeeds immediately (capacity available) or fails immediately
+    # (fully held), so this is deterministic with no sleep or wait needed.
+    # A successful acquire is released right away so it doesn't itself
+    # consume the capacity we're trying to observe.
+    def gate_is_exhausted() -> bool:
+        acquired = gate.acquire(blocking=False)
+        if acquired:
+            gate.release()
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=len(large_files) + len(normal_files)) as pool:
+        large_futures = [
+            pool.submit(
+                mod._run_one_file_gated, f, [], Path("."), 30.0, 0, gate
+            )
+            for f in large_files
+        ]
+
+        assert entered[large_files[0]].wait(timeout=2), "first large file never started"
+        # Deterministic, no sleep: the semaphore (capacity 1) is held by
+        # large_files[0], so a non-blocking acquire attempt must fail —
+        # proving no other large file could be inside the gate right now.
+        assert gate_is_exhausted(), "gate was not held while first large file ran"
+        assert not entered[large_files[1]].is_set(), (
+            "second large file started while the gate was held"
+        )
+        assert not entered[large_files[2]].is_set(), (
+            "third large file started while the gate was held"
+        )
+
+        # Normal files are ungated: they must complete promptly even while
+        # a large file is still holding the gate open.
+        normal_futures = [
+            pool.submit(
+                mod._run_one_file_gated, f, [], Path("."), 30.0, 0, None
+            )
+            for f in normal_files
+        ]
+        for fut in normal_futures:
+            fut.result(timeout=2)
+
+        release[large_files[0]].set()
+        assert entered[large_files[1]].wait(timeout=2)
+        release[large_files[1]].set()
+        assert entered[large_files[2]].wait(timeout=2)
+        release[large_files[2]].set()
+
+        for fut in large_futures:
+            fut.result(timeout=5)
+
+    assert max_concurrent_large == 1
+
+
+def test_submission_order_normal_files_before_large_files() -> None:
+    """Normal files precede statically-large files; relative order within
+    each group is preserved (see _submission_order).
+
+    Regression coverage for the controller finding: with FIFO
+    ThreadPoolExecutor submission, a gated large file submitted ahead of a
+    normal file could occupy a worker thread waiting on the semaphore
+    before the normal file's future is even queued — silently stealing a
+    worker slot from ordinary work despite the semaphore's mutual
+    exclusion being correct on its own.
+    """
+    mod = _load_runner_module()
+    threshold = mod._LARGE_FILE_TEST_COUNT_THRESHOLD
+
+    small = Path("tests/test_small.py")
+    normal_a = Path("tests/test_normal_a.py")
+    normal_b = Path("tests/test_normal_b.py")
+    large_a = Path("tests/test_large_a.py")
+    large_b = Path("tests/test_large_b.py")
+
+    test_counts = {
+        large_a: threshold,
+        normal_a: threshold - 1,
+        large_b: threshold + 50,
+        normal_b: 3,
+        small: 0,
+    }
+
+    # Discovery/slice order deliberately interleaves large and normal so
+    # the helper's reordering (not accidental input order) is what's
+    # under test.
+    files = [large_a, normal_a, large_b, normal_b, small]
+
+    ordered = mod._submission_order(files, test_counts)
+
+    assert ordered == [normal_a, normal_b, small, large_a, large_b]
+    # Every normal file's index precedes every large file's index.
+    normal_set = {normal_a, normal_b, small}
+    large_set = {large_a, large_b}
+    last_normal_idx = max(ordered.index(f) for f in normal_set)
+    first_large_idx = min(ordered.index(f) for f in large_set)
+    assert last_normal_idx < first_large_idx

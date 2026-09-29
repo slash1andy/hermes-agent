@@ -96,8 +96,23 @@ _DEFAULT_FILE_RETRIES = 1
 
 # Duration cache: maps relative file paths to last-observed subprocess
 # wall-clock seconds. Used by ``--slice`` to distribute files across
-# CI jobs by estimated total time, so no one job gets all the slow files.
+# CI jobs by estimated total time, so no one job gets all the slow files,
+# and by ``_effective_file_timeout`` to give known-slow files a
+# proportional timeout instead of the flat cap.
 _DURATIONS_FILE = "test_durations.json"
+
+# Cold-cache large-file concurrency gate. A file's approximate test count
+# (see _approximately_count_tests) predicts its solo subprocess wall time
+# via the per-test interpreter-startup overhead noted in the module
+# docstring (~250ms/test): a ~400-test file runs ~100-115s alone (observed:
+# tests/test_hermes_state.py at 435 tests, ~113-115s at -j1). Under a cold
+# bytecode/import cache, several such files competing for CPU across
+# workers dilate each one past --file-timeout and get SIGKILL'd even
+# though nothing is actually hung. Only a handful of files in this repo
+# cross 400 tests; gating just those, and submitting every normal file
+# ahead of them (see _submission_order), preserves full worker parallelism
+# for normal files.
+_LARGE_FILE_TEST_COUNT_THRESHOLD = 400
 
 
 def _approximately_count_tests(
@@ -228,6 +243,125 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         pass
 
 
+def _effective_file_timeout(
+    file: Path,
+    repo_root: Path,
+    file_timeout: float,
+    durations: "dict[str, float] | None",
+) -> float:
+    """Scale the per-file timeout for files whose last observed clean
+    runtime approaches the flat cap.
+
+    The flat ``file_timeout`` (default 300s) is sized for the typical
+    file, but a handful of large-collection files legitimately run 100s+
+    on a quiet runner. Under contention (cold cache, concurrent workers)
+    that dilates past the cap, the file is SIGKILL'd mid-run — a
+    manufactured timeout for a file that was never hung.
+
+    Rule: a file gets ``max(flat_cap, 3 * last observed clean duration)``.
+    Files without a cache entry (or a cached duration of 0, which cannot
+    reflect a real pytest run) keep the flat cap. This only ever *raises*
+    the bound — a genuinely hung file is still killed, just with headroom
+    proportional to its known-good runtime.
+    """
+    if not durations:
+        return file_timeout
+    cached = durations.get(_format_file(file, repo_root))
+    if not cached:
+        return file_timeout
+    return max(file_timeout, float(cached) * 3.0)
+
+
+def _clean_pass_durations(
+    file_times: List[Tuple[Path, float]],
+    failures: List[Tuple[Path, str, "Dict[str, int]"]],
+    flaky: List[Tuple[Path, str]],
+) -> List[Tuple[Path, float]]:
+    """Keep only durations from files that passed on their first attempt.
+
+    ``file_times`` records every file's total subprocess wall time,
+    including a timed-out attempt (~the cap) and retry-summed walls for
+    FLAKY files. Feeding those into the duration cache would let
+    ``_effective_file_timeout`` compound: a file that hangs once is cached
+    at ~300s, gets a 900s bound next run, hangs again and is cached at
+    ~900s, and so on until the job timeout is the only bound left. A
+    duration is a measurement of a healthy first-attempt run or it is not
+    a measurement; failed and retry-healed files keep their last known-good
+    cache entry instead (or no entry, until they pass clean once).
+    """
+    excluded = {f for f, _o, _s in failures} | {f for f, _o in flaky}
+    return [(f, t) for f, t in file_times if f not in excluded]
+
+
+def _is_large_file(file: Path, test_counts: "dict[Path, int]") -> bool:
+    """True if *file*'s approximate test count crosses the cold-cache
+    concurrency gate threshold (see _LARGE_FILE_TEST_COUNT_THRESHOLD)."""
+    return test_counts.get(file, 0) >= _LARGE_FILE_TEST_COUNT_THRESHOLD
+
+
+def _submission_order(
+    files: List[Path], test_counts: "dict[Path, int]"
+) -> List[Path]:
+    """Reorder *files* so every normal file precedes every statically-large
+    (gated) file, preserving each group's relative order.
+
+    ThreadPoolExecutor runs queued work in FIFO submission order. The
+    semaphore in ``_run_one_file_gated`` correctly limits concurrent large
+    files to one, but mutual exclusion alone does not guarantee normal-file
+    parallelism: if a gated large file's future were submitted before a
+    normal file's, a worker thread could pick it up and block on the
+    semaphore before the normal file's future is even queued, stealing a
+    worker slot from ordinary work. Submitting normal files first guarantees
+    they claim worker threads ahead of any gated file — normal-file
+    parallelism holds *because* normal work is submitted before gated work,
+    not merely because the gate itself ignores normal files.
+    """
+    normal = [f for f in files if not _is_large_file(f, test_counts)]
+    large = [f for f in files if _is_large_file(f, test_counts)]
+    return normal + large
+
+
+def _run_one_file_gated(
+    file: Path,
+    pytest_args: List[str],
+    repo_root: Path,
+    file_timeout: float,
+    retries: int,
+    gate: "threading.Semaphore | None",
+) -> Tuple[Path, int, str, dict[str, int], float]:
+    """Run one file, serialized behind *gate* when it is not None.
+
+    Only statically-large files (see ``_is_large_file``) are ever given a
+    gate; every other file gets ``gate=None``. Normal files keep full
+    ThreadPoolExecutor parallelism because they are submitted to the pool
+    before any gated file (see ``_submission_order``) — with FIFO
+    submission, that ordering is what actually keeps a gated future from
+    occupying a worker thread ahead of normal work, not the gate alone.
+    The gate is held for the file's entire retry sequence (see
+    ``_run_one_file``), not just its first attempt.
+    """
+    if gate is None:
+        return _run_one_file(file, pytest_args, repo_root, file_timeout, retries)
+    with gate:
+        return _run_one_file(file, pytest_args, repo_root, file_timeout, retries)
+
+
+def _is_retryable(rc: int) -> bool:
+    """True for an ordinary non-zero test exit; false for a runner-imposed
+    kill.
+
+    rc 124 is this runner's own convention for "SIGKILL'd on
+    --file-timeout" (see ``_run_one_file_once``), and a negative rc is
+    POSIX for "killed by signal N" (e.g. an OOM-killer SIGKILL). Neither
+    means the tests themselves failed — retrying would just re-run a file
+    the runner (or the OS) just killed for exceeding its bound, risking a
+    second manufactured FLAKY pass instead of surfacing the real timeout.
+    Ordinary nonzero pytest exits (assertion failures, collection errors,
+    ...) remain retry-eligible with the existing loud FLAKY reporting.
+    """
+    return rc != 0 and rc != 124 and rc >= 0
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
@@ -240,9 +374,10 @@ def _run_one_file(
     Returns (file, returncode, captured_combined_output, summary_counts, subprocess_wall_seconds).
 
     ``retries`` > 0 enables the one-shot flake retry: a non-zero exit is
-    re-run in a fresh subprocess; if the re-run passes, the file counts as
-    passed but the output is prefixed with a FLAKY banner and the file/output
-    are recorded in ``_FLAKY_RESULTS`` so the summary can call it out. A
+    re-run in a fresh subprocess (unless it is not retry-eligible — see
+    ``_is_retryable``); if the re-run passes, the file counts as passed but
+    the output is prefixed with a FLAKY banner and the file/output are
+    recorded in ``_FLAKY_RESULTS`` so the summary can call it out. A
     deterministic failure fails every attempt, so real regressions cannot
     be laundered green.
 
@@ -271,7 +406,7 @@ def _run_one_file(
         file, pytest_args, repo_root, file_timeout
     )
     attempt = 0
-    while rc != 0 and attempt < retries:
+    while _is_retryable(rc) and attempt < retries:
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
@@ -991,13 +1126,31 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
+    # Duration cache for the timeout scaler (see _effective_file_timeout):
+    # known-slow files get proportional headroom instead of a false
+    # timeout-kill under load. Loaded once, up front, so it reflects the
+    # cache from before this run started (not entries this run itself
+    # produces) — independent of --slice, which loads its own copy.
+    timeout_durations = _load_durations(repo_root)
+    # Cold-cache protection: at most one statically-large file runs at a
+    # time (see _LARGE_FILE_TEST_COUNT_THRESHOLD / _is_large_file). Normal
+    # files are never given this gate, and are submitted to the pool ahead
+    # of every gated file (see _submission_order) so they run with full
+    # pool parallelism instead of racing a gated file for a worker thread.
+    large_file_gate = threading.Semaphore(1)
+    files = _submission_order(files, test_counts)
+
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures: List[Future] = []
         for file in files:
             t0 = time.monotonic()
+            effective_timeout = _effective_file_timeout(
+                file, repo_root, args.file_timeout, timeout_durations
+            )
+            gate = large_file_gate if _is_large_file(file, test_counts) else None
             fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
+                _run_one_file_gated, file, pytest_passthrough, repo_root,
+                effective_timeout, args.file_retries, gate,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
@@ -1042,13 +1195,17 @@ def main() -> int:
             print(f"  {_format_file(f, repo_root)}")
             print(output.rstrip())
 
-    # Save durations for future --slice runs. Each slice writes its own
-    # partial test_durations.json; a CI merge step joins them later.
-    # Locally, _save_durations merges with any existing cache so entries
-    # from previous runs aren't lost.
-    if file_times:
-        _save_durations(file_times, repo_root)
-        print(f"  Durations cached to {_DURATIONS_FILE} ({len(file_times)} files)")
+    # Save durations for future --slice runs and the timeout scaler (see
+    # _effective_file_timeout). Only first-attempt-clean durations are kept
+    # (see _clean_pass_durations) — a failed, timed-out, or retry-healed
+    # file must not inflate its own future timeout budget. Each slice
+    # writes its own partial test_durations.json; a CI merge step joins
+    # them later. Locally, _save_durations merges with any existing cache
+    # so entries from previous runs aren't lost.
+    clean_times = _clean_pass_durations(file_times, failures, _FLAKY_RESULTS)
+    if clean_times:
+        _save_durations(clean_times, repo_root)
+        print(f"  Durations cached to {_DURATIONS_FILE} ({len(clean_times)} files)")
 
     # Per-file time distribution (throwaway diagnostic — shows how
     # subprocess time is distributed so we can see if startup dominates).
