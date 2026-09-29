@@ -2208,11 +2208,8 @@ DEFAULT_CONFIG = {
         # Recency window in seconds; 600 covers a multi-tool turn. Bridged to
         # HERMES_MEDIA_TRUST_RECENT_SECONDS. Only consulted when strict is true.
         "trust_recent_files_seconds": 600,
-        # Ordinary-turn and /bg admission guard, not a transport-wide claim: when true, this process's OWN
-        # launch config (never a served profile's) must resolve a usable proxy URL
-        # (GATEWAY_PROXY_URL / gateway.proxy_url) or the turn is refused rather than falling back to
-        # local execution (gateway/proxy_admission.py). Absent/false preserves ordinary local turns and /bg.
-        # Any explicit non-bool value or an unparsable/malformed root config fails closed (denies).
+        # Root policy for ordinary turns and /bg; absent/false permits local execution.
+        # Invalid policy fails closed. Native API admission and remote executors are separate.
         "proxy_required": False,
         "api_server": {  # OpenAI-compatible API server platform (gateway/platforms/api_server.py).
             # Max concurrent agent runs. Requests to /v1/chat/completions, /v1/responses, and

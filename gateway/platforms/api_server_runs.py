@@ -25,6 +25,7 @@ except ImportError:
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
+from gateway.proxy_admission import ApiAgentAdmissionDenied
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
@@ -943,6 +944,11 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         # Same controlled provider-auth message the _run_agent() endpoints give.
         logger.warning("Provider resolution failed for run=%s: %s", run_id, exc)
         _finish("failed", error=exc.user_text())
+    except ApiAgentAdmissionDenied as exc:
+        # Late policy-race / direct-caller denial at _create_agent: terminal failed, never a
+        # successful completion — no local/proxy retry or fallback.
+        logger.warning("API agent creation refused for run=%s: %s", run_id, exc)
+        _finish("failed", completed=False, failed=True, error=str(exc))
     except Exception as exc:
         logger.exception("[api_server] run %s failed", run_id)
         _finish("failed", error=_redact_api_error_text(exc))

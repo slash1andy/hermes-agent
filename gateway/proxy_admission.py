@@ -32,30 +32,41 @@ class ProxyPolicyError(Exception):
     """Raised when the process-root proxy policy cannot be confirmed safe (fail closed)."""
 
 
+class ApiAgentAdmissionDenied(Exception):
+    """Raised by ``admit_local_api_agent_creation`` when the process-root proxy policy refuses
+    local execution of a native API agent turn. Distinct from ``ProxyPolicyError`` (which is only
+    the config-read primitive) and never ``_ProviderAuthResolutionError`` — that type's caller
+    contract renders a plain completed-looking text reply, which would silently launder a refused
+    turn as success. ``malformed`` distinguishes an unresolved/invalid root policy (503) from an
+    explicit ``proxy_required: true`` (403); the message is a fixed, safe diagnostic sentence with
+    no config or exception content."""
+
+    def __init__(self, message: str, *, malformed: bool = False) -> None:
+        super().__init__(message)
+        self.malformed = malformed
+
+
+def admit_local_api_agent_creation() -> None:
+    """Recheck ``gateway.proxy_required`` before native API agent creation."""
+    try:
+        proxy_required = gateway_proxy_required()
+    except ProxyPolicyError as exc:
+        raise ApiAgentAdmissionDenied(
+            f"{PROXY_REQUIRED_KEY} policy is unresolved; refusing this API agent request.",
+            malformed=True) from exc
+    if proxy_required:
+        raise ApiAgentAdmissionDenied(
+            f"local API agent execution is disabled by {PROXY_REQUIRED_KEY}.")
+
+
 def gateway_proxy_required() -> bool:
-    """``True`` when this process's own launch config declares ``gateway.proxy_required: true``.
+    """Read the process-root policy, isolated from any served profile scope.
 
-    Reads via ``get_routing_process_hermes_home()`` (the pinned launch identity, else the live
-    process env — never a served profile's ContextVar override). The active task may have a
-    served profile's secret scope installed (e.g. mid turn); a root-owned ``${VAR}`` ref must
-    resolve against THIS process's own authority, not that scope, so the scope is cleared here for
-    the read and restored immediately after — the same ``set_secret_scope``/``reset_secret_scope``
-    primitive every other scoped read uses, no ``os.environ`` mutation.
-
-    Raises ``ProxyPolicyError`` (never the raw parse/config exception, which may quote file
-    content) when the root config can't be parsed, the root or ``gateway`` shape isn't a mapping,
-    or ``proxy_required`` is present but not a plain bool — callers must treat that as "policy
-    unconfirmed, refuse this turn entirely" (fail closed to denying BOTH local and proxy dispatch),
-    not "absent" and not merely "required".
+    Invalid or unreadable policy raises ``ProxyPolicyError`` so callers fail closed.
     """
     config_path = get_routing_process_hermes_home() / "config.yaml"
     token = set_secret_scope(None)
     try:
-        # ``require_readable_config_before_write`` is the strict primitive that fails closed on an
-        # unreadable/unparseable/non-mapping root instead of collapsing it to ``{}``. Its RETURNED
-        # mapping is what gets expanded/overlaid below — never a second open of config_path — so
-        # there is no window between "validated" and "read for real" where a racing writer could
-        # replace the file with non-mapping content that a fresh re-open would silently coerce away.
         try:
             raw = require_readable_config_before_write(config_path)
         except Exception as exc:

@@ -190,11 +190,15 @@ async def test_native_api_server_threads_declared_session_key_to_agent_construct
     home_client_a_noauth = _profile_home(
         tmp_path, "client-a-noauth", extra_env={"GATEWAY_PROXY_URL": f"{base_url}/p/owner-a"})
 
-    # This process's OWN launch config (pinned, not merely a served profile) declares the required
-    # proxy admission policy true. It must not change one bit of the existing remote-positive
-    # behaviour below: a configured proxy URL still makes exactly one real request per call.
-    (home_client_a / "config.yaml").write_text(
-        yaml.safe_dump({"gateway": {"proxy_required": True}}), encoding="utf-8")
+    # This process's OWN launch config is pinned (not merely a served profile) so the real
+    # client-side dispatch resolves against it. It is deliberately left WITHOUT
+    # ``gateway.proxy_required: true`` here: this fixture hosts both the client dispatch AND the
+    # native receiver's ``_create_agent`` in the SAME process, and ``admit_local_api_agent_creation``
+    # reads that pinned process root too -- a required policy here would refuse the native
+    # receiver's own construction, not just the client's local fallback. This test exercises real
+    # in-process wire/profile/memory-identity forwarding, not the two-process required-proxy
+    # admission policy (see ``test_proxy_executor_process.py`` for that, with a genuinely separate
+    # child process).
     hermes_constants.pin_process_hermes_home(str(home_client_a))
 
     profiles = {
