@@ -273,6 +273,38 @@ Returns a machine-readable description of the API server's stable surface for ex
 
 Use this endpoint when integrating dashboards, browser UIs, or control planes so they can discover whether the running Hermes version supports runs, streaming, cancellation, and session continuity without depending on private Python internals.
 
+### POST /v1/audio/transcriptions
+
+Transcribes one uploaded audio file using Hermes' existing speech-to-text engine (the same
+provider/local-fallback chain voice messages use). This is a narrow, file-only multipart
+receiver — **not** full OpenAI Audio API compatibility. It accepts exactly one `file` field and
+nothing else: no `url`, `model`, `provider`, or `response_format` fields, no streaming, and no
+other OpenAI audio endpoint (`/v1/audio/speech`, `/v1/audio/translations`, ...) is implemented.
+
+```bash
+curl http://localhost:8642/v1/audio/transcriptions \
+  -H "Authorization: Bearer $API_SERVER_KEY" \
+  -F "file=@clip.wav"
+```
+
+**Response:**
+```json
+{"text": "transcribed speech"}
+```
+
+Notes:
+- Unlike the other endpoints, this one always requires a configured, verified `API_SERVER_KEY`
+  — there is no anonymous default-profile fallback.
+- The uploaded filename is display-only (used only to pick a supported extension); it is never
+  used as a storage path.
+- The upload is capped at the same size limit as remote voice-message transcription
+  (`tools.transcription_common.MAX_FILE_SIZE`, 25 MB) and must use one of the supported native
+  audio extensions.
+- Honors `stt.enabled: false` for the resolved profile (`503`) and the same
+  configured-provider → local-fallback recovery voice messages use.
+- This endpoint is a standalone HTTP receiver only. Landing it does not wire any transport
+  listener, voice-reply pipeline, or realtime voice feature on top of it.
+
 ## Browser-extension control
 
 Hermes can route browser tools through an authenticated extension that controls
@@ -829,7 +861,7 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 ## Limitations
 
 - **Response storage** — stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
-- **No file upload** — inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files (`file`, `input_file`, `file_id`) and non-image document inputs are not supported through the API.
+- **No file upload on chat/responses** — inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files (`file`, `input_file`, `file_id`) and non-image document inputs are not supported through those endpoints. The one exception is the dedicated `POST /v1/audio/transcriptions` file-only multipart receiver described above, which is not full OpenAI Audio API compatibility.
 - **Simple OpenAI clients still see an alias** — `/v1/models` advertises the
   stable Hermes alias (`hermes-agent` or the active profile name). Richer
   clients can send explicit `provider` / `model_options` overrides on requests.

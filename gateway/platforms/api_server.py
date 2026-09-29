@@ -1524,6 +1524,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from gateway.platforms.api_server_cron_delivery import handle_cron_delivery
         return await handle_cron_delivery(request)
 
+    async def _handle_audio_transcriptions(self, request: "web.Request") -> "web.Response":
+        """POST /v1/audio/transcriptions (+ ``/p/<profile>/`` mirror) — thin delegation; the real
+        handler lives in ``api_server_audio.py`` (auth, strict file-only multipart, the existing
+        STT seam, cancellation-safe threaded processing). File-only subset, not full OpenAI Audio
+        API compatibility — see that module's docstring."""
+        from gateway.platforms.api_server_audio import handle_audio_transcriptions
+        return await handle_audio_transcriptions(self, request)
+
     # -- Multi-profile multiplexing (/p/<profile>/...) --------------------------------
 
     def _resolve_request_profile(self, request: "web.Request"):
@@ -1627,6 +1635,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
+            # File-only multipart subset receiver (prerequisite slice, not full OpenAI Audio
+            # API compatibility); see api_server_audio.py.
+            ("POST", "/v1/audio/transcriptions", self._handle_audio_transcriptions),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
             # Platform event ingress: authenticated by the target adapter's own verifier,
