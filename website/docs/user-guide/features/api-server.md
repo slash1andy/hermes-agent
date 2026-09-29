@@ -302,8 +302,16 @@ Notes:
   audio extensions.
 - Honors `stt.enabled: false` for the resolved profile (`503`) and the same
   configured-provider → local-fallback recovery voice messages use.
-- This endpoint is a standalone HTTP receiver only. Landing it does not wire any transport
-  listener, voice-reply pipeline, or realtime voice feature on top of it.
+- When a gateway process has a configured proxy URL (`GATEWAY_PROXY_URL` or
+  `gateway.proxy_url`), its ordinary inbound voice-message processing dispatches here for native
+  STT instead of transcribing locally. When proxy use is required (`gateway.proxy_required`) but
+  no URL is configured, the gateway refuses the request rather than using local STT. A configured
+  URL or required proxy owns STT, with no automatic local fallback on a failed or denied remote
+  call. If that same process also has `stt.enabled: false`, voice messages get a neutral
+  untranscribed note with no HTTP call at all — disabled STT is never silently routed to the remote
+  receiver. The handoff is wired for ordinary, pending, and clarification message processing; it
+  is not a realtime voice or voice-reply feature, and does not prove a deployed integration or
+  operating-system listener.
 
 ## Browser-extension control
 

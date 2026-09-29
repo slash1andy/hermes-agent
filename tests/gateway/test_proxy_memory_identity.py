@@ -115,6 +115,11 @@ async def _start_shared_native_server(server_runner):
     app["api_server_adapter"] = adapter
     app.router.add_route("POST", "/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_route("POST", "/p/{profile}/v1/chat/completions", adapter._handle_chat_completions)
+    # Native audio transcription receiver mirror: the exact two routes ``connect()`` wires
+    # (``_http_route_table`` + the profile-prefix registration loop), reused here rather than a
+    # fake policy middleware. See ``tests/gateway/test_proxy_voice_handoff.py``.
+    app.router.add_route("POST", "/v1/audio/transcriptions", adapter._handle_audio_transcriptions)
+    app.router.add_route("POST", "/p/{profile}/v1/audio/transcriptions", adapter._handle_audio_transcriptions)
     app_runner = web.AppRunner(app)
     await app_runner.setup()
     site = web.TCPSite(app_runner, "127.0.0.1", 0)
