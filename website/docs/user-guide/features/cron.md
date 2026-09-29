@@ -604,6 +604,33 @@ error. A delivery failure does not count toward the job's `failure_streak`
 - **Queued is not completed.** Cron records receipt IDs and `queued`/`claimed` statuses in `last_delivery_queued`, with delivery outcome `queued` (neither delivered nor failed). A successful job shows `delivery_queued`; genuine errors on other targets still take precedence as delivery failures. The bot may complete later. The durable receipt in the target profile's `runtime/bot_live_delivery/<receipt-id>.json` is authoritative; cron's historical status is not automatically refreshed.
 - Rechecking the same execution inspects its existing receipt, even if the owner has disappeared. It never falls back to another writer after acceptance. `failed`, `cancelled`, or `ambiguous` receipts are not automatically replayed; inspect the chat and receipt before intentionally starting new work. Each new cron execution has a distinct delivery ID.
 
+### Authenticated isolated cron delivery (`POST /p/<profile>/cron/deliveries`)
+
+An opt-in HTTP extension on the API server adapter for an external/restart-safe worker that needs
+to hand a plain-text result to a named profile's cron delivery queue without holding that
+profile's own gateway credentials.
+
+- **Opt-in per profile.** Set a dedicated `CRON_DELIVERY_KEY` (32+ characters) in the target
+  profile's `.env`. This is a *separate* credential from `API_SERVER_KEY` — the two are never
+  interchangeable, and the endpoint only answers under a named `/p/<profile>/` prefix (never the
+  bare/default listener).
+- **Body:** a small allowlisted JSON object — `execution_id`, `platform`, `chat_id`, optional
+  `thread_id`, `content`. No job config, script, session, or callback fields; unknown fields are
+  rejected.
+- **Target authorization is never taken from the request.** The `(platform, chat_id, thread_id)`
+  triple must match one of the primary gateway's own `profile_routes` entries for that profile —
+  the same check the scheduler itself uses to deliver through a shared bot. A key valid for one
+  profile can never deliver to another profile's or another route's chat.
+- **Durable enqueue, not a synchronous send.** A successful call returns `202` with a receipt
+  (`execution_id`); the actual send happens on the next native scheduler drain, through the same
+  live-adapter/standalone delivery path as any other cron job. A repeated call with the same
+  `execution_id` and the same payload/target replays the prior outcome (`200` once terminal); the
+  same `execution_id` with a different payload or target is a `409` conflict.
+- **Plain text only in this slice.** Any `MEDIA:`/media-directive syntax in `content` is rejected
+  before the request is even queued — there is no OS-level sandboxing or process isolation claim
+  here, only credential and route scoping. Media delivery through this endpoint is a follow-up,
+  not yet implemented.
+
 ### Routing intent (`all`)
 
 `all` lets you ship one cron job to every messaging channel you have configured, without having to enumerate them by name. It is **resolved at fire time**, so a job created before you wired up Telegram will pick up Telegram on the next tick after you set `TELEGRAM_HOME_CHANNEL`.

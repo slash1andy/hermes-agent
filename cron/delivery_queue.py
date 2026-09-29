@@ -30,7 +30,16 @@ logger = logging.getLogger(__name__)
 DELIVERY_DB: Optional[Path] = None
 _PROCESS_ID = uuid.uuid4().hex
 _lock = threading.RLock()
-_ACTIVE_DELIVERIES: set[str] = set()
+# Keyed by (canonical queue path, execution_id): a bare execution_id aliases two profiles that
+# happen to reuse the same id (two homes' rows are different rows, but the in-memory in-flight
+# marker was shared) — one profile's claim/finish incorrectly cleared another's "still delivering".
+_ACTIVE_DELIVERIES: set[tuple[str, str]] = set()
+
+
+def _active_key(execution_id: str) -> tuple[str, str]:
+    return (str(_path()), str(execution_id))
+
+
 _TERMINAL = ("delivered", "failed", "unknown", "suppressed")
 MAX_TERMINAL_DELIVERIES = 1000
 DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS = 300.0
@@ -54,8 +63,8 @@ def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
     if excess > 0:
         conn.execute(
             """INSERT OR IGNORE INTO delivery_tombstones
-               (execution_id, terminal_status, finished_at)
-               SELECT execution_id, status, finished_at FROM deliveries
+               (execution_id, terminal_status, finished_at, request_fingerprint)
+               SELECT execution_id, status, finished_at, request_fingerprint FROM deliveries
                WHERE status IN ('delivered','failed','unknown','suppressed')
                ORDER BY finished_at, created_at, execution_id
                LIMIT ?""",
@@ -125,12 +134,26 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              execution_id TEXT PRIMARY KEY,
              terminal_status TEXT NOT NULL CHECK(terminal_status IN
                ('delivered','failed','unknown','suppressed')),
-             finished_at TEXT
+             finished_at TEXT,
+             request_fingerprint TEXT
            )"""
     )
     add_column_if_missing(
         conn, "deliveries", "for_failure",
         "for_failure INTEGER NOT NULL DEFAULT 0",
+    )
+    # Binds a row to the exact validated envelope (profile + target + payload) that created it, so
+    # an authenticated replay can be told apart from a same-id conflict even after terminal-payload
+    # redaction (job_json/content blanked above) and tombstone pruning. NULL on every pre-existing
+    # row: a legacy row recorded no such binding, so it can never satisfy an authenticated replay
+    # (a fingerprinted request always compares unequal to NULL).
+    add_column_if_missing(
+        conn, "deliveries", "request_fingerprint",
+        "request_fingerprint TEXT",
+    )
+    add_column_if_missing(
+        conn, "delivery_tombstones", "request_fingerprint",
+        "request_fingerprint TEXT",
     )
 
 
@@ -166,33 +189,51 @@ def enqueue(
     content: str,
     *,
     for_failure: bool = False,
+    request_fingerprint: Optional[str] = None,
 ) -> dict:
-    """Persist one idempotent delivery request before the worker waits."""
+    """Persist one idempotent delivery request before the worker waits.
+
+    ``request_fingerprint`` (opt-in — legacy callers pass none and keep the old blind-replay
+    behavior) binds this call to the exact validated envelope (profile + target + payload) that
+    produced it: a second call with the SAME execution_id and a DIFFERENT fingerprint returns
+    ``{"status": "conflict"}`` instead of the existing/tombstoned row, whatever that row's own
+    status is. A legacy row/tombstone (fingerprint NULL) can never match a fingerprinted replay.
+    """
     with _transaction() as conn:
         # Serialize the tombstone check and insert with retention in other
         # processes, which can move a terminal delivery into the tombstone table.
         conn.execute("BEGIN IMMEDIATE")
         tombstone = conn.execute(
-            "SELECT terminal_status, finished_at FROM delivery_tombstones "
+            "SELECT terminal_status, finished_at, request_fingerprint FROM delivery_tombstones "
             "WHERE execution_id=?",
             (str(execution_id),),
         ).fetchone()
         if tombstone is not None:
+            if request_fingerprint is not None and tombstone["request_fingerprint"] != request_fingerprint:
+                return {"execution_id": str(execution_id), "status": "conflict"}
             return {
                 "execution_id": str(execution_id),
                 "status": tombstone["terminal_status"],
                 "finished_at": tombstone["finished_at"],
             }
+        existing = conn.execute(
+            "SELECT * FROM deliveries WHERE execution_id=?", (str(execution_id),)
+        ).fetchone()
+        if existing is not None:
+            if request_fingerprint is not None and existing["request_fingerprint"] != request_fingerprint:
+                return {"execution_id": str(execution_id), "status": "conflict"}
+            return dict(existing)
         conn.execute(
-            """INSERT OR IGNORE INTO deliveries
-               (execution_id, job_json, content, for_failure, status, created_at)
-               VALUES (?, ?, ?, ?, 'pending', ?)""",
+            """INSERT INTO deliveries
+               (execution_id, job_json, content, for_failure, status, created_at, request_fingerprint)
+               VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
             (
                 str(execution_id),
                 json.dumps(job, ensure_ascii=False, sort_keys=True),
                 str(content),
                 int(bool(for_failure)),
                 _hermes_now().isoformat(),
+                request_fingerprint,
             ),
         )
         row = conn.execute(
@@ -245,14 +286,28 @@ def claim_next() -> Optional[dict]:
         claimed = conn.execute(
             "SELECT * FROM deliveries WHERE execution_id=?", (row["execution_id"],)
         ).fetchone()
-        _ACTIVE_DELIVERIES.add(row["execution_id"])
+        _ACTIVE_DELIVERIES.add(_active_key(row["execution_id"]))
     result = dict(claimed)
     result["job"] = json.loads(result.pop("job_json"))
     return result
 
 
-def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False) -> bool:
-    status = "failed" if error else "suppressed" if suppressed else "delivered"
+def _finish(
+    execution_id: str, *, error: Optional[str], suppressed: bool = False, unknown: bool = False,
+) -> bool:
+    """``unknown`` (server-derived, never client-selectable — see
+    ``cron.scheduler_delivery._live_send_text``) reclassifies an errored terminal outcome whose
+    dispatch certainty could not be proven (a raised provider exception, or an ambiguous timeout,
+    after an actual send attempt) as ``unknown`` instead of ``failed``: the send may have gone
+    through, so it must never be retried, but it must also not be reported as a proven failure.
+    Ignored when there is no error — a successful or suppressed outcome is never marked uncertain.
+    """
+    status = (
+        "unknown" if error and unknown
+        else "failed" if error
+        else "suppressed" if suppressed
+        else "delivered"
+    )
     safe_error = (
         redact_sensitive_text(str(error), force=True, redact_url_credentials=True)
         if error
@@ -288,7 +343,7 @@ def recover_abandoned() -> int:
             same_process = row["owner_process_id"] == _PROCESS_ID
             if same_process:
                 with _lock:
-                    if row["execution_id"] in _ACTIVE_DELIVERIES:
+                    if _active_key(row["execution_id"]) in _ACTIVE_DELIVERIES:
                         continue
             elif _owner_is_live(int(row["owner_pid"]), row["owner_started_at"]):
                 continue
@@ -323,7 +378,7 @@ def drain(
         if row is None:
             break
         with _lock:
-            _ACTIVE_DELIVERIES.add(row["execution_id"])
+            _ACTIVE_DELIVERIES.add(_active_key(row["execution_id"]))
         try:
             try:
                 error = send(
@@ -332,10 +387,11 @@ def drain(
             except BaseException as exc:
                 error = f"{type(exc).__name__}: {exc}"
             _finish(row["execution_id"], error=error,
-                    suppressed=bool(row["job"].get("_notification_all_targets_suppressed")))
+                    suppressed=bool(row["job"].get("_notification_all_targets_suppressed")),
+                    unknown=bool(row["job"].get("_delivery_outcome_unknown")))
         finally:
             with _lock:
-                _ACTIVE_DELIVERIES.discard(row["execution_id"])
+                _ACTIVE_DELIVERIES.discard(_active_key(row["execution_id"]))
         processed += 1
     return processed
 

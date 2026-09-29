@@ -1302,6 +1302,9 @@ def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
     }.items() if (job.get(key) or None) != value}
     if not values:
         return
+    from cron.isolated_delivery import is_marked
+    if is_marked(job):
+        return  # transient isolated-HTTP envelope: no cron.jobs row exists for this id.
     job.update(values)
     try:
         from cron.jobs import update_job
@@ -1368,17 +1371,42 @@ def _resolve_target_transport(
     from gateway.delivery import DeliveryTransport, resolve_delivery_transport
     target_adapters = adapters
     transport = None
-    if isinstance(adapters, _preflight.SharedRouteAdapters):
+    from cron.isolated_delivery import is_marked
+    if is_marked(job):
+        # A marked isolated-HTTP envelope never trusts the tick-start ``adapters`` snapshot — a
+        # raw primary-adapter dict (bypassing SharedRouteAdapters) must not skip these checks any
+        # more than the wrapped case does. Re-check ownership + authorization fresh, every call,
+        # straight from the primary's current config.yaml, independent of ``adapters``' shape.
+        from cron.isolated_delivery import authorize_target, owning_profile_matches_current_home
+        if not owning_profile_matches_current_home(job):
+            return None, f"platform '{platform_name}' isolated delivery profile mismatch"
+        if isinstance(adapters, _preflight.SharedRouteAdapters):
+            primary_adapter = adapters._primary.get(platform)
+        elif isinstance(adapters, dict):
+            primary_adapter = adapters.get(platform)
+        else:
+            primary_adapter = None
+        if primary_adapter is None or not authorize_target(platform, target.get("chat_id"), target.get("thread_id")):
+            return None, (
+                f"platform '{platform_name}' route is not authorized for this isolated "
+                "delivery (revoked or never granted)")
+        target_adapters = {platform: primary_adapter}
+        # The PRIMARY's route authorized this exact native adapter. A satellite's own
+        # ``platforms.<p>`` block describes a connector it never runs (no credential), so neither
+        # its absence nor ``enabled: false`` may veto the shared transport; only its non-credential
+        # settings (continuable surface, reply mode) are kept (#89302, #103701).
+        from dataclasses import replace
+        from gateway.config import PlatformConfig
+        own = config.platforms.get(platform)
+        transport = DeliveryTransport(
+            primary_adapter, replace(own, enabled=True) if own is not None else PlatformConfig(enabled=True),
+            platform)
+    elif isinstance(adapters, _preflight.SharedRouteAdapters):
         # Credentialless satellite: the primary adapter serves THIS target only when an exact
-        # primary route maps it to this profile; a miss fails closed below.
-        # See #101113.
+        # primary route maps it to this profile; a miss fails closed below. See #101113.
         shared = adapters.get(platform, target)
         target_adapters = {platform: shared} if shared is not None else {}
         if shared is not None:
-            # The PRIMARY's route authorized this exact native adapter. The satellite's own
-            # ``platforms.<p>`` block describes a connector it never runs (no credential), so
-            # neither its absence nor ``enabled: false`` may veto the shared transport; only its
-            # non-credential settings (continuable surface, reply mode) are kept (#89302, #103701).
             from dataclasses import replace
             from gateway.config import PlatformConfig
             own = config.platforms.get(platform)
@@ -1484,8 +1512,11 @@ def _live_send_text(
     target_errors: list, delivery_errors: list, unverified_targets: list,
 ) -> tuple[bool, bool, Any]:
     """Schedule the text send on the gateway loop; returns ``(adapter_ok, timed_out, message_id)``.
-    Re-raises a real send error so the caller falls through to standalone."""
+    For an ordinary (non-marked) job, re-raises a real send error so the caller falls through to
+    standalone. A marked isolated-HTTP envelope never gets that fallback: an ambiguous timeout or a
+    raised provider exception is reported directly as an unsuccessful/uncertain outcome instead."""
     from agent.async_utils import safe_schedule_threadsafe
+    from cron.isolated_delivery import is_marked
     from gateway.delivery import DeliveryRouter, DeliveryTarget
     job = t.job
     router = DeliveryRouter(t.config, t.target_adapters)
@@ -1505,9 +1536,25 @@ def _live_send_text(
     try:
         send_result = future.result(timeout=60)
     except TimeoutError:
-        # Slow confirmation != failure; future.cancel() disambiguates. False -> already in flight,
-        # cannot be un-sent, standalone resend would DUPLICATE: assume delivered. True -> never
-        # started (loop wedged): MUST fall through to standalone or it is silently dropped.
+        if is_marked(job):
+            # A marked isolated-HTTP envelope never assumes delivery from an ambiguous signal,
+            # and cancel() cannot prove the coroutine never started: a proxy future observed to
+            # have already begun running can still report cancel()==True (RED v4). So cancel() is
+            # called only as best-effort cleanup, never as evidence either way — this is always
+            # reported unsuccessful/uncertain, with no standalone fallback (the caller denies it
+            # outright for marked jobs) and no assumed success, recorded as an unknown (not
+            # failed) durable outcome; see _finish's unknown param.
+            future.cancel()
+            msg = (
+                f"live adapter send to {t.where} timed out after 60s with no delivery "
+                "confirmation; isolated delivery does not assume success")
+            logger.warning("Job '%s': %s", job["id"], msg)
+            target_errors.append(msg)
+            job["_delivery_outcome_unknown"] = True
+            return False, True, None
+        # Ordinary job: slow confirmation != failure; future.cancel() disambiguates. False ->
+        # already in flight OR already finished. True -> never started (loop wedged): MUST fall
+        # through to standalone or it is silently dropped.
         if future.cancel():
             msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
             logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
@@ -1521,7 +1568,17 @@ def _live_send_text(
             job["id"], t.platform_name, t.chat_id)
         return True, True, None
     except Exception as ex:
-        # Real send error (not a slow confirmation): fall through to standalone.
+        if is_marked(job):
+            # Real send error, but a marked isolated envelope gets no standalone fallback and
+            # must never surface the raw provider exception text (may carry provider-internal
+            # detail) into a log or a persisted error — a fixed safe label only, returned
+            # directly as an unsuccessful/uncertain outcome instead of re-raised.
+            msg = f"live adapter send to {t.where} failed; isolated delivery does not assume success"
+            logger.warning("Job '%s': %s", job["id"], msg)
+            target_errors.append(msg)
+            job["_delivery_outcome_unknown"] = True
+            return False, True, None
+        # Ordinary job: real send error (not a slow confirmation) — fall through to standalone.
         target_errors.append(f"live adapter send failed: {ex}")
         raise
 
@@ -1931,6 +1988,7 @@ def _deliver_result(
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
+    job.pop("_delivery_outcome_unknown", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
         _record_delivery_verification(job, [])
@@ -2007,8 +2065,10 @@ def _deliver_result(
 
     # Resolve the mirror gate ONCE (default off): successful deliveries are appended to the target
     # chat's session transcript. Mirror the CLEAN, unwrapped output (not the header/footer).
+    from cron.isolated_delivery import is_marked as _is_isolated_marked
+    marked = _is_isolated_marked(job)
     try:
-        mirror_enabled = _cron_mirror_delivery_enabled(job, user_cfg)
+        mirror_enabled = False if marked else _cron_mirror_delivery_enabled(job, user_cfg)
     except Exception:
         mirror_enabled = False
     # Independent of the mirror knob: continuable surfaces (in_channel) must seed even when
@@ -2062,8 +2122,13 @@ def _deliver_result(
             unverified_targets=unverified_targets,
         )
         if not delivered:
-            _deliver_standalone(
-                t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
+            if marked:
+                # A marked isolated-HTTP envelope never falls back to standalone — a map miss,
+                # disconnect, or a failed/uncertain live attempt all deny outright.
+                _note_target_error(job, f"isolated delivery to {t.where} did not reach a live adapter", delivery_errors)
+            else:
+                _deliver_standalone(
+                    t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
 
     # Filter-time drops apply to every target; report them once. A run whose every target was
     # suppressed sent nothing, so there is no drop to report.
