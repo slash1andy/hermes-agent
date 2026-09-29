@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 MAX_WIRE_BYTES = 64 * 1024
 MAX_CONTENT_BYTES = 16 * 1024
-MIN_DELIVERY_KEY_LEN = 32
+MIN_DELIVERY_KEY_LEN = _isolated.MIN_DELIVERY_KEY_LEN
 
 _ALLOWED_FIELDS = frozenset({"execution_id", "platform", "chat_id", "thread_id", "content"})
 _REQUIRED_FIELDS = frozenset({"execution_id", "platform", "chat_id", "content"})
@@ -123,14 +123,10 @@ def _validate_body(payload: Any) -> tuple[Optional[dict], Optional[str]]:
     if len(content_bytes) > MAX_CONTENT_BYTES:
         return None, "content too large"
 
-    # Case-sensitive substring matching (_has_media_directives) misses lowercase/mixed-case and
-    # Unicode-casefolded variants of the MEDIA: tag (e.g. "media:", "MeDiA:", "medİa:"). The native
-    # tag regexes are re.IGNORECASE and match those variants correctly — used directly (bare
-    # .search(), never the stat-performing _extensionless_media_matches/validate_media_delivery_path
-    # helpers) so rejection never touches the filesystem.
-    from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE, MEDIA_EXTENSIONLESS_TAG_RE
-    if (MEDIA_TAG_CLEANUP_RE.search(content) or MEDIA_EXTENSIONLESS_TAG_RE.search(content)
-            or "[[audio_as_voice]]" in content or "[[as_document]]" in content):
+    # Shared with the producer's pre-transmission guard (cron/isolated_delivery.py) so both sides
+    # reject the exact same directive shapes; bare regex .search(), never a stat-performing helper,
+    # so rejection never touches the filesystem.
+    if _isolated.has_media_directives(content):
         return None, "Media directives are not accepted on this endpoint"
 
     return {

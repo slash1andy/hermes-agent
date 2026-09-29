@@ -21,6 +21,7 @@ MARKER = "_isolated_http_delivery"
 
 EXECUTION_ID_MAX = 128
 TARGET_ID_MAX = 256
+MIN_DELIVERY_KEY_LEN = 32
 
 
 def is_marked(job: dict) -> bool:
@@ -61,6 +62,18 @@ def request_fingerprint(
          "chat_id": chat_id, "thread_id": thread_id, "content": content},
         sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def has_media_directives(text: str) -> bool:
+    """True if ``text`` carries a MEDIA:/attachment/control directive. Case-insensitive
+    (``re.IGNORECASE`` tag regexes), used directly via bare ``.search()`` so a caller can reject on
+    a positive match without ever touching a filesystem path. Shared by the HTTP ingress validator
+    and the producer's pre-transmission guard so both reject the exact same directive shapes."""
+    from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE, MEDIA_EXTENSIONLESS_TAG_RE
+
+    return bool(
+        MEDIA_TAG_CLEANUP_RE.search(text) or MEDIA_EXTENSIONLESS_TAG_RE.search(text)
+        or "[[audio_as_voice]]" in text or "[[as_document]]" in text)
 
 
 def authorize_target(platform, chat_id: str, thread_id: Optional[str]) -> bool:

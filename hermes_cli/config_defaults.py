@@ -1811,6 +1811,13 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a task-name header and "The agent cannot see this
         # message" footer. False = clean output.
         "wrap_response": True,
+        # Full URL of a remote profile's authenticated isolated-executor delivery endpoint (e.g.
+        # "http://host:port/p/alice/cron/deliveries"). When set, THIS process admits its outbound
+        # cron text through that HTTP endpoint (native drain on the receiving side does the actual
+        # send) instead of any local adapter — for executors with no live gateway of their own.
+        # "" = disabled (the normal local/standalone delivery lanes apply). Paired with the
+        # CRON_DELIVERY_KEY secret for the target profile.
+        "delivery_gateway_url": "",
         "delivery": {  # Delivery behaviour for cron output sent through a live gateway adapter.
             # Mark cron deliveries FINAL so the platform pushes them (Telegram's "important" mode
             # otherwise sends with disable_notification=True and briefs look undelivered). False =
@@ -3084,6 +3091,11 @@ OPTIONAL_ENV_VARS = {
         "enabled; server refuses to start without it.", "API server auth key", None, password=True,
         advanced=True),
     "API_SERVER_PORT": _msg("Port for the API server (default: 8642).", "API server port", None,
+        advanced=True),
+    "CRON_DELIVERY_KEY": _msg(
+        "Dedicated bearer token this profile presents to a remote profile's "
+        "POST /p/<profile>/cron/deliveries endpoint when cron.delivery_gateway_url is set. Never "
+        "shared with API_SERVER_KEY.", "Cron delivery auth key", None, password=True,
         advanced=True),
     "API_SERVER_HOST": _msg(
         "Host/bind address for the API server (default: 127.0.0.1). API_SERVER_KEY is still "

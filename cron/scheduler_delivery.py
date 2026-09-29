@@ -1979,6 +1979,33 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
     return msg
 
 
+def _bot_chat_target_outcome(receipt: Optional[dict], error: Optional[str]) -> str:
+    """Bot Chat outcome bucket for aggregation alongside any remote-gateway siblings, read from the
+    authoritative ``_bot_chat_delivery_receipts`` entry (never guessed from error text). Mirrors the
+    remote producer's own vocabulary: queued/claimed -> queued, settled -> delivered, suppressed ->
+    suppressed, failed -> failed, anything else terminal/uncertain (ambiguous, cancelled, an unknown
+    status) -> unknown. No receipt at all means the CLI-fallback lane ran inline: success (no error)
+    is a completed native delivery; ``BOT_CHAT_EXECUTION_DENIED_MARKER`` is native proof the attempt
+    never started (a definite failure for this target); any other unreceipted error is conservative
+    unknown."""
+    status = receipt["status"] if receipt else None
+    if status in ("queued", "claimed"):
+        return "queued"
+    if status == "settled":
+        return "delivered"
+    if status == "suppressed":
+        return "suppressed"
+    if status == "failed":
+        return "failed"
+    if status is not None:
+        return "unknown"
+    if error is None:
+        return "delivered"
+    if error == BOT_CHAT_EXECUTION_DENIED_MARKER:
+        return "failed"
+    return "unknown"
+
+
 def _deliver_result(
     job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
 ) -> Optional[str]:
@@ -1995,13 +2022,27 @@ def _deliver_result(
         _record_delivery_verification(job, [])
         return _unresolved_delivery_outcome(job, for_failure)
 
+    # A server-built isolated-HTTP envelope (drained here by the RECEIVER's own native ticker) must
+    # never recurse into a configured remote gateway of its own — it is always delivered locally.
+    from cron.isolated_delivery import is_marked as _is_isolated_marked
+    marked = _is_isolated_marked(job)
+
+    user_cfg = None
+    with contextlib.suppress(Exception):
+        user_cfg = _sched.load_config()
+
+    from cron.scheduler_remote_delivery import configured_delivery_gateway
+    gateway_status, gateway_url = (
+        ("disabled", None) if marked else configured_delivery_gateway(user_cfg))
+
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
     # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
     # id is the idempotency key (the queue never retries an uncertain claimed send). Match on THIS
     # job's own attempt: a worker's script may dispatch another job in-process (`hermes cron run`),
-    # and that nested delivery must not be keyed under the outer execution id.
+    # and that nested delivery must not be keyed under the outer execution id. An explicit configured
+    # remote gateway takes precedence over this local queue regardless of `adapters`.
     external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
-    if (external_execution and adapters is None
+    if (gateway_status == "disabled" and external_execution and adapters is None
             and external_execution == str(job.get("execution_id") or "")
             and any(target["platform"] != BOT_CHAT_PLATFORM for target in targets)):
         from cron.delivery_queue import enqueue_and_wait
@@ -2039,20 +2080,35 @@ def _deliver_result(
         job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
         return error
 
+    if gateway_status == "fail_closed":
+        # An unreadable config or a malformed non-empty URL must never be treated as "disabled" —
+        # that would silently fall through to a local send this profile never configured.
+        msg = "cron.delivery_gateway_url is configured but unusable; refusing to fall back locally"
+        logger.error("Job '%s': %s", job["id"], msg)
+        return msg
+
+    # Key resolution and the media/control-directive rejection are per-remote-target concerns, not
+    # a whole-run precheck: a Bot Chat target (or a target suppressed by warning-notification
+    # policy) must be admitted on its own regardless of the configured remote gateway's key/content
+    # shape, so both checks are deferred into the loop below, at the point an ACTUAL non-Bot-Chat
+    # configured target is handled (see ``gateway_secret_resolved``).
+    gateway_secret = None
+    gateway_secret_resolved = False
+
     from gateway.config import load_gateway_config
 
-    # Wrap with header/footer unless cron.wrap_response: false.
+    # Wrap with header/footer unless cron.wrap_response: false. A marked isolated envelope is
+    # already-formatted producer text (the sender wrapped it once) — never wrap it again here.
     wrap_response = True
-    user_cfg = None
-    with contextlib.suppress(Exception):
-        user_cfg = _sched.load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+    if user_cfg is not None:
+        with contextlib.suppress(Exception):
+            wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     # Mark live sends FINAL so the platform pushes them (Telegram "important" mode mutes otherwise).
     notify_delivery = _cron_delivery_notify_enabled(user_cfg)
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
-    if wrap_response:
+    if wrap_response and not marked:
         task_name = job.get("name", job["id"])
         delivery_content = (
             f"Cronjob Response: {task_name}\n"
@@ -2070,37 +2126,49 @@ def _deliver_result(
     # at boot; standalone runs (`hermes cron run`) did not, silently dropping files. Idempotent.
     from gateway.media_policy import apply_media_policy_env
     apply_media_policy_env(user_cfg)
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    # Redact at this single chokepoint, BEFORE the live-adapter / standalone send lanes below.
-    # Shell-job stdout/stderr is already redacted where it is captured, but an LLM cron job's
-    # response text reaches delivery unscanned — so a job that surfaced a credential (echoed a
-    # failing curl with an API key, summarised a config file) sent it verbatim to the chat.
+    if gateway_status == "configured":
+        # Every non-Bot-Chat target is about to leave through the remote gateway, never a local
+        # lane — the media guard above already fired, so there is nothing left to extract here.
+        media_files: list = []
+        cleaned_delivery_content = delivery_content
+        policy_drop_errors: list = []
+    else:
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+        # Redact at this single chokepoint, BEFORE the live-adapter / standalone send lanes below.
+        # Shell-job stdout/stderr is already redacted where it is captured, but an LLM cron job's
+        # response text reaches delivery unscanned — so a job that surfaced a credential (echoed a
+        # failing curl with an API key, summarised a config file) sent it verbatim to the chat.
+        requested_media = len(media_files)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        # Policy-dropped attachments will never be sent on ANY lane — record them in run status.
+        _policy_dropped = requested_media - len(media_files)
+        policy_drop_errors = [
+            f"{_policy_dropped} media attachment(s) dropped by media path "
+            "policy (missing file, denied prefix, or strict-mode miss); "
+            "see gateway.strict / media_delivery_allow_dirs in config.yaml"
+        ] if _policy_dropped > 0 else []
     cleaned_delivery_content = _redact_cron_payload(cleaned_delivery_content, "delivery content")
-    requested_media = len(media_files)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-    # Policy-dropped attachments will never be sent on ANY lane — record them in run status.
-    _policy_dropped = requested_media - len(media_files)
-    policy_drop_errors = [
-        f"{_policy_dropped} media attachment(s) dropped by media path "
-        "policy (missing file, denied prefix, or strict-mode miss); "
-        "see gateway.strict / media_delivery_allow_dirs in config.yaml"
-    ] if _policy_dropped > 0 else []
 
     # Resolve the mirror gate ONCE (default off): successful deliveries are appended to the target
     # chat's session transcript. Mirror the CLEAN, unwrapped output (not the header/footer).
-    from cron.isolated_delivery import is_marked as _is_isolated_marked
-    marked = _is_isolated_marked(job)
     try:
         mirror_enabled = False if marked else _cron_mirror_delivery_enabled(job, user_cfg)
     except Exception:
         mirror_enabled = False
     # Independent of the mirror knob: continuable surfaces (in_channel) must seed even when
     # attach_to_session=false and cron.mirror_delivery=false, else the seed gets "" and fails.
-    _, mirror_text = BasePlatformAdapter.extract_media(content)
-    # Derived from the raw `content`, so it does NOT inherit the redaction above. Without this,
-    # enabling the mirror writes an unredacted credential into the session transcript even though
-    # the chat message itself was clean — and a transcript outlives the message.
-    mirror_text = _redact_cron_payload((mirror_text or "").strip(), "mirror payload")
+    # A configured remote gateway never reaches `_prepare_target_delivery` (every non-Bot-Chat
+    # target leaves through the remote lane, Bot Chat delivers the raw `content` itself) — the
+    # remote native consumer owns mirroring on its own end, so extracting here would only stat/read
+    # media paths for a value no local lane will ever consume.
+    if gateway_status == "configured":
+        mirror_text = ""
+    else:
+        _, mirror_text = BasePlatformAdapter.extract_media(content)
+        # Derived from the raw `content`, so it does NOT inherit the redaction above. Without
+        # this, enabling the mirror writes an unredacted credential into the session transcript
+        # even though the chat message itself was clean — and a transcript outlives the message.
+        mirror_text = _redact_cron_payload((mirror_text or "").strip(), "mirror payload")
 
     try:
         config = load_gateway_config()
@@ -2111,7 +2179,9 @@ def _deliver_result(
 
     delivery_errors = []
     suppressed_targets = 0  # local: `job` is snapshotted into durable deferred records mid-loop
-    for target in targets:
+    remote_outcomes: list = []
+    bot_chat_outcomes: list = []
+    for slot, target in enumerate(targets):
         # A failure notice for a platform that hides warning notifications is a suppressed
         # disposition, not a send; requested (non-failure) results are never gated.
         from gateway.warning_notifications import warning_notifications_enabled
@@ -2119,17 +2189,60 @@ def _deliver_result(
                 and not warning_notifications_enabled(target["platform"], user_cfg)):
             suppressed_targets += 1
             continue
-        # Bot Chat owns admission; never concurrently resume a live owner's transcript.
+        # Bot Chat owns admission; never concurrently resume a live owner's transcript. Preserved
+        # unmodified even when a configured remote gateway handles every other target (mixed fan-out).
         if target["platform"] == BOT_CHAT_PLATFORM:
             bot_chat_error = _deliver_to_bot_chat(job, content, target["chat_id"], for_failure=for_failure)
             suppressed_targets += job.pop("_notification_all_targets_suppressed", False)
+            receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
+            receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
             if bot_chat_error:
-                receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
-                receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
                 if not receipt or receipt["status"] not in ("queued", "claimed"):
                     delivery_errors.append(bot_chat_error)
                 if receipt and receipt["status"] == "ambiguous":
                     unverified_targets.append(bot_chat_error)
+            bot_chat_outcomes.append(_bot_chat_target_outcome(receipt, bot_chat_error))
+            continue
+
+        if gateway_status == "configured":
+            # Resolved here, at the first ACTUAL non-Bot-Chat configured target — never ambiently
+            # before the loop, so a run whose targets are all Bot Chat (or all suppressed above)
+            # never touches the remote secret at all.
+            if not gateway_secret_resolved:
+                gateway_secret_resolved = True
+                from cron.scheduler_remote_delivery import configured_delivery_secret
+                gateway_secret = configured_delivery_secret()
+            if gateway_secret is None:
+                msg = "cron.delivery_gateway_url is configured but CRON_DELIVERY_KEY is missing/unusable"
+                logger.error("Job '%s': %s", job["id"], msg)
+                remote_outcomes.append("failed")
+                delivery_errors.append(msg)
+                continue
+            from cron.isolated_delivery import has_media_directives
+            if has_media_directives(content):
+                # Reject BEFORE any media path is ever read: this producer slice is plaintext-only.
+                # A definite pre-HTTP failure for THIS target only — sibling targets (Bot Chat, or
+                # another remote target already admitted) are unaffected.
+                msg = (
+                    "media/control directives are not supported through a configured "
+                    "cron.delivery_gateway_url; attachment intent was rejected")
+                logger.error("Job '%s': %s", job["id"], msg)
+                remote_outcomes.append("failed")
+                delivery_errors.append(msg)
+                continue
+            from cron.scheduler_remote_delivery import deliver_target as _deliver_via_gateway
+            lane = "failure" if for_failure else "success"
+            outcome, remote_error = _deliver_via_gateway(
+                job, target, cleaned_delivery_content, url=gateway_url, secret=gateway_secret,
+                lane=lane, slot=slot)
+            remote_outcomes.append(outcome)
+            if outcome == "suppressed":
+                # The receiver's own disposition, not a send: same accounting as the
+                # warning-notification suppression above, never an error.
+                suppressed_targets += 1
+            else:
+                if remote_error:
+                    delivery_errors.append(remote_error)
             continue
 
         t = _prepare_target_delivery(
@@ -2159,6 +2272,29 @@ def _deliver_result(
         job["_notification_all_targets_suppressed"] = True
     else:
         delivery_errors.extend(policy_drop_errors)
+    if remote_outcomes:
+        # Combine with Bot Chat siblings ONLY when at least one remote target was actually
+        # considered (this gate) — a pure Bot Chat run (remote_outcomes empty) never sets this
+        # scalar at all, preserving its own last_delivery_queued shape untouched.
+        combined_outcomes = remote_outcomes + bot_chat_outcomes
+        _accepted = any(o in ("queued", "delivered") for o in combined_outcomes)
+        _failed = any(o == "failed" for o in combined_outcomes)
+        if any(o == "unknown" for o in combined_outcomes) or (_accepted and _failed):
+            # Conservative aggregation: an outright-uncertain sibling, or a mixed batch (one
+            # target admitted, a sibling proven-rejected — remote or Bot Chat), is never collapsed
+            # into "queued" (overclaiming certainty) nor left to `delivery_errors` alone (which the
+            # caller's own delivery_error-before-queued precedence would otherwise report as
+            # complete failure even though another target may have been accepted).
+            job["_native_queue_status"] = "unknown"
+        elif all(o == "suppressed" for o in combined_outcomes):
+            job["_native_queue_status"] = "suppressed"
+        elif all(o == "delivered" for o in combined_outcomes if o != "suppressed"):
+            job["_native_queue_status"] = "delivered"
+        elif _accepted:
+            job["_native_queue_status"] = "queued"
+        elif _failed:
+            job["_native_queue_status"] = "failed"
+        # Terminal failed/suppressed outcomes can come from an already-admitted native queue.
     _record_delivery_verification(job, unverified_targets)
     return "; ".join(delivery_errors) if delivery_errors else None
 

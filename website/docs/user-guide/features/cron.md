@@ -643,6 +643,37 @@ profile's own gateway credentials.
   here, only credential and route scoping. Media delivery through this endpoint is a follow-up,
   not yet implemented.
 
+#### Producer side (`cron.delivery_gateway_url`)
+
+An executor with no live gateway of its own (a restart-safe worker, a scoped-down isolated
+profile) can send its cron output through the endpoint above instead of any local adapter: set
+`cron.delivery_gateway_url` to the target profile's full endpoint URL (e.g.
+`http://host:port/p/alice/cron/deliveries`) and a `CRON_DELIVERY_KEY` matching that profile's own.
+
+- **Takes precedence over every local lane** — the live adapter, the standalone HTTP sender, and
+  the restart-safe local delivery queue — whenever it is configured, regardless of whether this
+  process also happens to have live adapters. Bot Chat targets are unaffected and still deliver
+  locally even when other targets in the same run go out through this endpoint.
+- **Fails closed for the actual remote target, never silently local.** An unreadable/unparsable
+  profile `config.yaml` — read in the owning profile's native scope — is a run-wide configuration
+  error: it refuses all local fallback, rather than acting as a target-local precheck. Strict URL
+  and profile-config validation is likewise global to the run. For a remote target, a non-empty
+  `delivery_gateway_url` must be the full `/p/<valid-profile>/cron/deliveries` URL with `http` or
+  `https`, a hostname, a valid optional port, and no userinfo, query, fragment, or whitespace —
+  there is no silent repair. A missing/unusable dedicated `CRON_DELIVERY_KEY` or a `MEDIA:`/
+  media-directive restriction is eligible-target-specific: it refuses that remote target rather
+  than falling back locally. Those restrictions cannot refuse an independent `bot-chat` target or
+  an already-suppressed warning target, and do not make the model run fail; only a genuinely
+  empty/absent URL is disabled.
+- **One request per eligible outbound target per invocation, no retry.** Suppressed and
+  preflight-rejected targets are not eligible and receive no request. A `202` (`pending` or
+  `delivering`) records the admission snapshot as `queued`; a matching terminal `200` preserves
+  its reported `delivered`, `failed`, `unknown`, or `suppressed` outcome. A malformed or lost
+  response, transport failure, `409` conflict, or `5xx` records `unknown` — never a fallback or
+  retry. A terminal `200` that reports `failed`, and a definitive pre-admission rejection
+  (`400`/`401`/`403`/`404`), records `failed`; those status cases are not the only possible
+  reasons for a failed outcome.
+
 ### Routing intent (`all`)
 
 `all` lets you ship one cron job to every messaging channel you have configured, without having to enumerate them by name. It is **resolved at fire time**, so a job created before you wired up Telegram will pick up Telegram on the next tick after you set `TELEGRAM_HOME_CHANNEL`.
