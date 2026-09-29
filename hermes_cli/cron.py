@@ -196,17 +196,28 @@ def cron_list(show_all: bool = False):
     _warn_if_gateway_not_running()
 
 
+# Native delivery queue left the outcome genuinely uncertain: never "not delivered" (that is a
+# definitive claim), never a bare resend suggestion — the send may already have gone through.
+_DELIVERY_UNKNOWN_NOTE = "delivery outcome unknown/unconfirmed (may or may not have been delivered); do not resend"
+
+
 def _last_run_display(job: Dict[str, Any]) -> str:
     last_status = job["last_status"]
     if last_status == "ok":
         return color("ok", Colors.GREEN)
     if last_status == "delivery_queued":
         return color("finished; delivery is still in progress", Colors.YELLOW)
+    if last_status == "delivery_unknown":
+        return color(f"finished; {_DELIVERY_UNKNOWN_NOTE}", Colors.YELLOW)
     if last_status == "delivery_failed":
         # Agent succeeded but the result never reached the user — not green; last_error is None.
         return color(f"ran, but the result was not delivered ({_short_reason(job.get('last_delivery_error'))}). "
                      f"{_delivery_fix_hint(job)}", Colors.YELLOW)
     display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
+    if job.get("last_delivery_outcome") == "unknown":
+        # A model failure/crash still shows its real error; append the delivery uncertainty
+        # rather than letting the error text alone imply the result was never sent.
+        display += color(f"  ({_DELIVERY_UNKNOWN_NOTE})", Colors.YELLOW)
     streak = int(job.get("failure_streak") or 0)
     if streak >= 2:
         display += color(f"  ({streak} failures in a row)", Colors.RED)
@@ -272,7 +283,11 @@ def _job_warnings(job: Dict[str, Any]) -> List[str]:
     lines = []
     if queued := job.get("last_delivery_queued"):
         lines.append(f"Delivery still in progress (the result was handed off but not confirmed yet): {queued}")
-    if job.get("last_delivery_error"):
+    if job.get("last_delivery_outcome") == "unknown":
+        # Never "not delivered" here: the native queue lost certainty, not proof of failure.
+        lines.append(f"{color('⚠ Delivery outcome UNKNOWN:', Colors.YELLOW)} "
+                     f"{_short_reason(job.get('last_delivery_error'))} — do not resend.")
+    elif job.get("last_delivery_error"):
         lines.append(f"{color('⚠ The result was not delivered:', Colors.YELLOW)} "
                      f"{_short_reason(job['last_delivery_error'])}. {_delivery_fix_hint(job)}")
     # A live adapter acked the last send but returned no message_id / raw_response
@@ -611,10 +626,16 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
 def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
     issues: List[str] = []
     last_status = str(job.get("last_status") or "").strip().lower()
-    # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.
-    if last_status and last_status not in {"ok", "delivery_failed", "delivery_queued"}:
+    # "delivery_failed"/"delivery_unknown" = the agent run succeeded; the delivery issue below
+    # reports it.
+    if last_status and last_status not in {"ok", "delivery_failed", "delivery_queued", "delivery_unknown"}:
         issues.append(f"last run failed: {str(job.get('last_error') or 'unknown error').strip()}")
-    if delivery_err := str(job.get("last_delivery_error") or "").strip():
+    if job.get("last_delivery_outcome") == "unknown":
+        # Never "not delivered" here: the native queue lost certainty, not proof of failure.
+        issues.append(
+            f"last run's delivery outcome is unknown/unconfirmed "
+            f"({_short_reason(job.get('last_delivery_error'))}); do not resend.")
+    elif delivery_err := str(job.get("last_delivery_error") or "").strip():
         issues.append(f"last run finished but the result was not delivered ({_short_reason(delivery_err)}). "
                       f"{_delivery_fix_hint(job)}")
     if unverified := job.get("last_delivery_unverified"):

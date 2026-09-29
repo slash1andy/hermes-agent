@@ -2292,10 +2292,16 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
 
 def _record_run_outcome(
     job: Dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
-    status: Optional[str], now: str,
+    status: Optional[str], now: str, delivery_outcome: Optional[str] = None,
 ) -> None:
-    """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
+    """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims.
+
+    ``delivery_outcome`` is the native delivery queue's typed disposition ("queued"/"unknown"/
+    "delivered"/"failed") when the run's delivery actually went through that queue, else None —
+    always written (clearing any stale prior value) so it never lingers from an earlier run.
+    """
     job["last_run_at"] = now
+    job["last_delivery_outcome"] = delivery_outcome
     job.pop("manual_run_at", None)
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)
@@ -2378,6 +2384,7 @@ def mark_job_run(
     expected_fire_owner: Optional[str] = None,
     model_unreachable: bool = False,
     quota_hold_seconds: Optional[float] = None,
+    delivery_outcome: Optional[str] = None,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -2386,6 +2393,12 @@ def mark_job_run(
     ``last_status = "delivery_failed"`` (never "ok") while ``failure_streak`` is left alone. An
     explicit ``status`` (e.g. "blocked_config") overrides the derived value. False when the fence
     can't be taken, the job is missing, or ``expected_fire_owner`` no longer holds the fire claim.
+
+    ``delivery_outcome``: the native delivery queue's typed disposition for this run
+    ("queued"/"unknown"/"delivered"/"failed"), stored as ``last_delivery_outcome`` alongside
+    ``last_status``/``last_error`` so a model failure and an uncertain delivery can be recorded
+    together. Omitted (None) for any run whose delivery did not go through that queue, which
+    clears a stale value left by an earlier run.
 
     ``model_unreachable``: this failed run never reached the model (transient network/DNS error,
     zero API calls). Recurring jobs then get a bounded automatic re-run — ``next_run_at`` is pulled
@@ -2405,7 +2418,7 @@ def mark_job_run(
                     job_id)
                 return False
         now = _hermes_now().isoformat()
-        _record_run_outcome(job, success, error, delivery_error, status, now)
+        _record_run_outcome(job, success, error, delivery_error, status, now, delivery_outcome)
         _advance_after_run(job, now)
         from cron import quota_hold
         from cron.unreachable_retry import clear_state, plan_retry
@@ -2704,12 +2717,50 @@ def claim_job_for_fire(
         job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
         # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
+        pre_claim_next_run_at = job.get("next_run_at")
         if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
             nxt = compute_next_run(job["schedule"], now.isoformat())
             if nxt:
                 job["next_run_at"] = nxt
         save_jobs(jobs)
-        return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
+        if not return_job:
+            return True
+        # Ephemeral only (never persisted): lets a caller that later denies dispatch AFTER this
+        # claim (release_denied_fire_claim) restore the pre-advance instant in one CAS.
+        return dict(
+            copy.deepcopy(job), _scheduled_instant=instant,
+            _pre_claim_next_run_at=pre_claim_next_run_at)
+
+    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+
+
+def release_denied_fire_claim(
+    job_id: str, *, expected_owner: str, expected_next_run_at: Any = None,
+    restore_next_run_at: Optional[str] = None,
+) -> bool:
+    """Release a ``fire_claim`` THIS acquisition made, when local dispatch was denied AFTER the
+    claim (the before-dispatch path never claims at all — nothing to release there).
+
+    Owner-fenced like ``heartbeat_fire_claim``: a claim already replaced by a successor (a
+    different ``by`` token) is left completely untouched — never cleared, never overwritten.
+    ``next_run_at`` is restored to *restore_next_run_at* only as a CAS: the CURRENT value must
+    still equal *expected_next_run_at* (this claim's own advance), so a schedule/admin edit made
+    after the claim is never clobbered. Same fence + lock as ``claim_job_for_fire``. Does not touch
+    ``pending_slot``/the executions ledger: ``cron.occurrences.completed_occurrence`` already
+    treats a non-'completed' attempt as eligible for replay.
+    """
+    def apply(jobs, _i, job):
+        claim = job.get("fire_claim")
+        owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+        if owner != expected_owner:
+            return False
+        job.pop("fire_claim", None)
+        if (restore_next_run_at is not None
+                and job.get("next_run_at") == expected_next_run_at
+                and job.get("schedule", {}).get("kind") in {"cron", "interval"}):
+            job["next_run_at"] = restore_next_run_at
+        save_jobs(jobs)
+        return True
 
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
 

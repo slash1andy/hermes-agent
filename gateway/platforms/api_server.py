@@ -1511,6 +1511,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 code="platform_event_dispatch_failed")
         return web.json_response(result if isinstance(result, dict) else {})
 
+    async def _handle_cron_delivery(self, request: "web.Request") -> "web.Response":
+        """POST /cron/deliveries (+ ``/p/<profile>/`` mirror) — thin delegation; the real handler
+        lives in ``api_server_cron_delivery.py`` (auth, validation, authorization, enqueue)."""
+        from gateway.platforms.api_server_cron_delivery import handle_cron_delivery
+        return await handle_cron_delivery(request)
+
     # -- Multi-profile multiplexing (/p/<profile>/...) --------------------------------
 
     def _resolve_request_profile(self, request: "web.Request"):
@@ -1626,7 +1632,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
-            ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
+            ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            # Authenticated isolated cron delivery (dedicated CRON_DELIVERY_KEY, never
+            # API_SERVER_KEY); see gateway/platforms/api_server_cron_delivery.py.
+            ("POST", "/cron/deliveries", self._handle_cron_delivery)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:

@@ -591,6 +591,18 @@ error. A delivery failure does not count toward the job's `failure_streak`
 (the agent did its job); the next fully successful run returns the status to
 `ok`.
 
+A restart-safe external cron worker hands its send to the durable native delivery queue and
+waits for a gateway to process it. That wait can end without a proven send: the row may still be
+queued for the next gateway, or a claiming gateway may have exited mid-send with the outcome never
+confirmed. These are recorded as `last_status: delivery_queued` / `delivery_unknown` (never
+`delivery_failed` — the message may already be on its way, or already delivered) with the queue's
+own disposition (`queued`/`unknown`/`delivered`/`failed`) mirrored in `last_delivery_outcome` and
+the execution's ledger `delivery_outcome`. An `unknown` outcome is never resent automatically and
+is never shown as a definitive failure — `hermes cron list`/`doctor` and a manual run's summary
+call it out as unconfirmed instead. A model failure keeps its own `last_status: error` and
+`last_error` regardless of the delivery outcome; `last_delivery_outcome` records the delivery
+uncertainty alongside it rather than overwriting it.
+
 ### Bot Chat delivery (`bot-chat`)
 
 `bot-chat` delivers the output **into a profile's canonical "Bot Chat" session as a real message**. Unlike every other target — where the recipient is a human reading a channel — the recipient here is the bot itself: it receives the output as an incoming message, acts on anything that needs action, and responds in its chat. Use it when scheduled output should be *processed*, not just posted.
@@ -603,6 +615,64 @@ error. A delivery failure does not count toward the job's `failure_streak`
 - Never-started outputs have no TTL: if an unsupported owner never releases, they remain queued rather than being silently dropped. Receipts retain their payloads indefinitely. An unexpected delivery exception is logged and retained as `ambiguous`, without stopping sibling deliveries in that drain; claimed/ambiguous attempts are never automatically replayed.
 - **Queued is not completed.** Cron records receipt IDs and `queued`/`claimed` statuses in `last_delivery_queued`, with delivery outcome `queued` (neither delivered nor failed). A successful job shows `delivery_queued`; genuine errors on other targets still take precedence as delivery failures. The bot may complete later. The durable receipt in the target profile's `runtime/bot_live_delivery/<receipt-id>.json` is authoritative; cron's historical status is not automatically refreshed.
 - Rechecking the same execution inspects its existing receipt, even if the owner has disappeared. It never falls back to another writer after acceptance. `failed`, `cancelled`, or `ambiguous` receipts are not automatically replayed; inspect the chat and receipt before intentionally starting new work. Each new cron execution has a distinct delivery ID.
+
+### Authenticated isolated cron delivery (`POST /p/<profile>/cron/deliveries`)
+
+An opt-in HTTP extension on the API server adapter for an external/restart-safe worker that needs
+to hand a plain-text result to a named profile's cron delivery queue without holding that
+profile's own gateway credentials.
+
+- **Opt-in per profile.** Set a dedicated `CRON_DELIVERY_KEY` (32+ characters) in the target
+  profile's `.env`. This is a *separate* credential from `API_SERVER_KEY` — the two are never
+  interchangeable, and the endpoint only answers under a named `/p/<profile>/` prefix (never the
+  bare/default listener).
+- **Body:** a small allowlisted JSON object — `execution_id`, `platform`, `chat_id`, optional
+  `thread_id`, `content`. No job config, script, session, or callback fields; unknown fields are
+  rejected.
+- **Target authorization is never taken from the request.** The `(platform, chat_id, thread_id)`
+  triple must match one of the primary gateway's own `profile_routes` entries for that profile —
+  the same check the scheduler itself uses to deliver through a shared bot. A key valid for one
+  profile can never deliver to another profile's or another route's chat.
+- **Durable enqueue, not a synchronous send.** A successful call returns `202` with a receipt
+  (`execution_id`); the actual send happens on the next native scheduler drain, through the same
+  live-adapter/standalone delivery path as any other cron job. A repeated call with the same
+  `execution_id` and the same payload/target replays the prior outcome (`200` once terminal); the
+  same `execution_id` with a different payload or target is a `409` conflict.
+- **Plain text only in this slice.** Any `MEDIA:`/media-directive syntax in `content` is rejected
+  before the request is even queued — there is no OS-level sandboxing or process isolation claim
+  here, only credential and route scoping. Media delivery through this endpoint is a follow-up,
+  not yet implemented.
+
+#### Producer side (`cron.delivery_gateway_url`)
+
+An executor with no live gateway of its own (a restart-safe worker, a scoped-down isolated
+profile) can send its cron output through the endpoint above instead of any local adapter: set
+`cron.delivery_gateway_url` to the target profile's full endpoint URL (e.g.
+`http://host:port/p/alice/cron/deliveries`) and a `CRON_DELIVERY_KEY` matching that profile's own.
+
+- **Takes precedence over every local lane** — the live adapter, the standalone HTTP sender, and
+  the restart-safe local delivery queue — whenever it is configured, regardless of whether this
+  process also happens to have live adapters. Bot Chat targets are unaffected and still deliver
+  locally even when other targets in the same run go out through this endpoint.
+- **Fails closed for the actual remote target, never silently local.** An unreadable/unparsable
+  profile `config.yaml` — read in the owning profile's native scope — is a run-wide configuration
+  error: it refuses all local fallback, rather than acting as a target-local precheck. Strict URL
+  and profile-config validation is likewise global to the run. For a remote target, a non-empty
+  `delivery_gateway_url` must be the full `/p/<valid-profile>/cron/deliveries` URL with `http` or
+  `https`, a hostname, a valid optional port, and no userinfo, query, fragment, or whitespace —
+  there is no silent repair. A missing/unusable dedicated `CRON_DELIVERY_KEY` or a `MEDIA:`/
+  media-directive restriction is eligible-target-specific: it refuses that remote target rather
+  than falling back locally. Those restrictions cannot refuse an independent `bot-chat` target or
+  an already-suppressed warning target, and do not make the model run fail; only a genuinely
+  empty/absent URL is disabled.
+- **One request per eligible outbound target per invocation, no retry.** Suppressed and
+  preflight-rejected targets are not eligible and receive no request. A `202` (`pending` or
+  `delivering`) records the admission snapshot as `queued`; a matching terminal `200` preserves
+  its reported `delivered`, `failed`, `unknown`, or `suppressed` outcome. A malformed or lost
+  response, transport failure, `409` conflict, or `5xx` records `unknown` — never a fallback or
+  retry. A terminal `200` that reports `failed`, and a definitive pre-admission rejection
+  (`400`/`401`/`403`/`404`), records `failed`; those status cases are not the only possible
+  reasons for a failed outcome.
 
 ### Routing intent (`all`)
 
@@ -1361,3 +1431,14 @@ Cron jobs run in a completely fresh agent session. The prompt must contain every
 ## Security
 
 Scheduled task prompts are scanned for prompt-injection and credential-exfiltration patterns at creation and update time. Prompts containing invisible Unicode tricks, SSH backdoor attempts, or obvious secret-exfiltration payloads are blocked.
+
+## Disabling local execution on a shared transport process
+
+`cron.execution_enabled` (default `true`) controls whether **this process** may run cron work locally — launch a job's script, construct an agent for it, or dispatch a due job from its own tick. Set it to `false` in the config of the profile this process was **launched as** (which may itself be a named profile, e.g. `hermes -p work gateway run`) to stop that process from executing local cron jobs while it keeps serving other traffic (a Photon listener multiplexing several profiles, for example, where execution is meant to happen on remote isolated executors instead).
+
+A few things this setting is and is not:
+
+- It is read from the config of the profile this process was **launched as**, independent of any OTHER profile it merely serves (multiplexing) during a given tick or turn — a served profile's own `config.yaml` cannot re-enable execution from inside that served scope, and setting it back to `true` there has no effect on this process's own policy.
+- Only the literal boolean `true` enables execution. Any other explicit value (a string, a number, `null`), or a `cron` section that isn't a mapping, or a process config that fails to parse, **denies** — this setting fails closed rather than silently falling back to enabled. Leaving the key out entirely preserves the current default (enabled).
+- It does not touch delivery: the delivery queue (results already produced elsewhere) keeps draining and delivering on this process regardless of this setting. This is a dispatch/execution guard, not a queue toggle.
+- **It is a configuration guard, not an OS-level sandbox.** It does not provide process isolation, filesystem/network confinement, or a container boundary — it only decides whether this process's scheduler may start local cron work. A complete isolated-delivery runtime (real container boundaries, media/background/auth isolation) is a separate, later piece of work.

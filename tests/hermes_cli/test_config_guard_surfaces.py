@@ -70,21 +70,33 @@ class TestCronRunJobGuard:
         success, output_doc, final_response, error = run_job(self._job())
 
         assert success is False
-        assert error is not None
-        assert "Hermes stopped because your settings file" in error
-        assert "config.yaml" in error
+        assert error
+        assert error.startswith("Cron execution denied:")
+        assert "cron.execution_enabled" in error
+        assert "unterminated" not in f"{output_doc}\n{error}"
         assert final_response == ""
 
 
-    def test_run_job_no_agent_exempt(self, tmp_path):
-        from cron.scheduler import run_job
+    def test_no_agent_not_exempt_from_process_admission(self, tmp_path, monkeypatch):
+        from unittest.mock import Mock
+
+        from cron import scheduler
 
         _write_corrupt_config(tmp_path)
+        run_no_agent_job = Mock(side_effect=AssertionError("no_agent runner must not be invoked"))
+        monkeypatch.setattr(scheduler, "_run_no_agent_job", run_no_agent_job)
 
-        success, output_doc, final_response, error = run_job(
+        success, output_doc, final_response, error = scheduler.run_job(
             self._job(no_agent=True, script="true", deliver="none")
         )
-        assert "Hermes stopped because your settings file" not in (error or "")
+
+        assert success is False
+        assert error
+        assert error.startswith("Cron execution denied:")
+        assert "cron.execution_enabled" in error
+        assert "unterminated" not in f"{output_doc}\n{error}"
+        assert final_response == ""
+        run_no_agent_job.assert_not_called()
 
 
 class TestServeGuard:

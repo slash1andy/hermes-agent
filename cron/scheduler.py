@@ -2172,6 +2172,17 @@ def _prepare_job_prompt(
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
     injection block, empty prompt); otherwise ``prompt`` is set."""
+    # Transport-process execution admission — must dominate every other gate below (no_agent,
+    # config-parse, monitor, wake): a denied process launches neither a script subprocess nor an
+    # AIAgent, regardless of job shape. cron/scheduler_admission.py; independent of delivery-queue
+    # draining, which never routes through run_job.
+    from cron.scheduler_admission import cron_execution_denied_reason
+
+    _denied = cron_execution_denied_reason()
+    if _denied is not None:
+        logger.warning("Job '%s': %s", job_id, _denied)
+        return (False, f"# Cron Job: {job_name}\n\nError: {_denied}\n", "", _denied), None
+
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     if not job.get("no_agent"):
@@ -2711,6 +2722,28 @@ def run_one_job(
     claim (callers use the store CAS) but keeps it alive. True if processed (a job failure is
     recorded via ``mark_job_run``), False only if processing raised. ``cancel_event``: optional
     transport-level cancel (dashboard drain)."""
+    # Transport-process admission. The tick and the built-in fire path (claim_fire) already deny
+    # BEFORE claiming, so this normally only covers a caller that hands run_one_job a job dict
+    # directly; but policy can also flip AFTER a real claim_fire (claim_fire allowed, fire_claimed
+    # denied) — release that claim here so the occurrence stays immediately re-runnable rather than
+    # stuck until FIRE_CLAIM_TTL_SECONDS expires.
+    from cron.jobs import release_denied_fire_claim
+    from cron.scheduler_admission import cron_execution_denied_reason
+
+    _denied = cron_execution_denied_reason()
+    if _denied is not None:
+        logger.warning("Job '%s': %s", job.get("id"), _denied)
+        _execution_id = job.get("execution_id")
+        if _execution_id:
+            finish_execution(str(_execution_id), success=False, error=_denied)
+        _claim = job.get("fire_claim")
+        if isinstance(_claim, dict) and _claim.get("by"):
+            release_denied_fire_claim(
+                job["id"], expected_owner=str(_claim["by"]),
+                expected_next_run_at=job.get("next_run_at"),
+                restore_next_run_at=job.get("_pre_claim_next_run_at"))
+        return True
+
     # Every gateway path (built-in scheduler, external providers, and direct
     # API fires) crosses this seam.  Ensure the detached worker has a durable
     # attempt to adopt before any launch can occur.
@@ -2796,9 +2829,16 @@ def _classify_delivery_outcome(
     *, delivery_error, should_deliver: bool, unresolved_origin: bool,
     normalized_deliver: str, incident_acked: bool, success: bool,
     delivery_queued=None, notification_suppressed: bool = False,
+    native_queue_outcome: Optional[str] = None,
 ) -> str:
+    # The native delivery queue's own typed disposition is authoritative over a generic
+    # delivery_error string: an unresolved send is neither a proven failure nor silence.
+    if native_queue_outcome == "unknown":
+        return "unknown"
     if delivery_error:
         return "failed"
+    if native_queue_outcome == "queued":
+        return "queued"
     if should_deliver and delivery_queued:
         return "queued"
     if notification_suppressed:
@@ -2929,6 +2969,9 @@ class _RunDelivery:
     error: Optional[str]
     delivery_attempted: bool = False
     delivery_error: Optional[str] = None
+    # Native delivery queue's typed disposition ("queued"/"unknown"/"delivered"/"failed") when
+    # this run's delivery went through that queue; None otherwise.
+    native_queue_outcome: Optional[str] = None
     should_deliver: bool = False
     unresolved_origin: bool = False
     blocked_config: bool = False
@@ -3016,6 +3059,7 @@ def _save_compose_deliver(
                 # on the failure path) honor the job's failure_deliver override (NS-788).
                 for_failure=not d.success,
             )
+            d.native_queue_outcome = job.pop("_native_queue_status", None)
     except Exception as de:
         if isinstance(de, _FireClaimLostDuringSideEffect):
             raise
@@ -3061,6 +3105,15 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         mark_kwargs["quota_hold_seconds"] = _hold_s
     if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
         mark_kwargs["status"] = "delivery_queued"
+    # A model failure keeps last_status="error" regardless of delivery outcome (retains the real
+    # model error); the native queue's typed status only overrides last_status on a successful run.
+    if d.success:
+        if d.native_queue_outcome == "queued":
+            mark_kwargs["status"] = "delivery_queued"
+        elif d.native_queue_outcome == "unknown":
+            mark_kwargs["status"] = "delivery_unknown"
+    if d.native_queue_outcome is not None:
+        mark_kwargs["delivery_outcome"] = d.native_queue_outcome
     if fire_owner is not None:
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
@@ -3083,6 +3136,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)),
         incident_acked=d.incident_acked,
         success=d.success,
+        native_queue_outcome=d.native_queue_outcome,
     )
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
@@ -3094,14 +3148,16 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
 
 def _deliver_crash_failure(
     job: dict, err_text: str, *, adapters, loop,
-) -> tuple[Optional[str], str]:
-    """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
+) -> tuple[Optional[str], str, Optional[str]]:
+    """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome,
+    native_queue_outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
-        return None, "suppressed_acked"
+        return None, "suppressed_acked", None
     delivery_error = None
+    native_queue_outcome = None
     try:
         delivery_error = _deliver_result(
             job,
@@ -3112,6 +3168,7 @@ def _deliver_crash_failure(
             loop=loop,
             for_failure=True,
         )
+        native_queue_outcome = job.pop("_native_queue_status", None)
     except Exception as delivery_exc:
         delivery_error = str(delivery_exc)
         logger.error("Delivery failed for job %s: %s", job["id"], delivery_exc)
@@ -3124,10 +3181,11 @@ def _deliver_crash_failure(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"),
-        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
+        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
+        native_queue_outcome=native_queue_outcome)
     if delivery_outcome in ("delivered", "not_configured"):
         _mark_incident_alerted(failure_incident_id)
-    return delivery_error, delivery_outcome
+    return delivery_error, delivery_outcome, native_queue_outcome
 
 
 
@@ -3315,6 +3373,7 @@ def _run_one_job_body(
             _err_text,
             exc_info=(type(e), e, e.__traceback__))
         delivery_outcome = "suppressed"
+        native_queue_outcome = None
         # Owner fencing: a stale worker whose claim was taken over (or transport-cancelled) must not
         # send a failure alert on top of the replacement run's; fall through to fenced bookkeeping.
         if (
@@ -3323,7 +3382,7 @@ def _run_one_job_body(
             and not isinstance(e, _FireClaimLostDuringSideEffect)
             and not _fire_claim_ownership_lost()
         ):
-            delivery_error, delivery_outcome = _deliver_crash_failure(
+            delivery_error, delivery_outcome, native_queue_outcome = _deliver_crash_failure(
                 job, _err_text, adapters=adapters, loop=loop)
         try:
             if (
@@ -3335,6 +3394,8 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if isinstance(e, Exception):
                     mark_kwargs["delivery_error"] = delivery_error
+                    if native_queue_outcome is not None:
+                        mark_kwargs["delivery_outcome"] = native_queue_outcome
                 mark_job_run(job["id"], False, _err_text, **mark_kwargs)
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
@@ -4028,6 +4089,12 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    # advance_next_runs() (scheduler_tick.py) already advanced the whole due batch's next_run_at
+    # BEFORE this claim ran, so claim_job_for_fire's own _pre_claim_next_run_at snapshot is that
+    # already-advanced value, not the original due slot. The due-scan's `job` (captured before the
+    # batch advance) still carries the true original instant — a denied-after-claim run must
+    # restore to THAT, not to the tick's own intermediate advance.
+    claimed_job["_pre_claim_next_run_at"] = job.get("next_run_at")
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 

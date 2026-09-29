@@ -52,6 +52,19 @@ def _tick_admitted(
             drain()
         else:
             drain_in_background()
+
+        # Transport-process execution admission (cron/scheduler_admission.py) — checked AFTER
+        # queue draining (already-executed results keep delivering) but BEFORE worktree
+        # maintenance and the due-job scan/advance/dispatch, so a denied process never advances
+        # next_run_at, stamps a fire_claim, or launches a worktree-maintenance/script/agent
+        # subprocess for a job it isn't allowed to run.
+        from cron.scheduler_admission import cron_execution_denied_reason
+
+        _denied_reason = cron_execution_denied_reason()
+        if _denied_reason is not None:
+            _sched.logger.debug("Cron tick dispatch denied: %s", _denied_reason)
+            return 0
+
         _sched._maybe_reap_dead_owners()
         # Periodic worktree GC (6h, threaded) — the only sweep gateway-only boxes get.
         try:
