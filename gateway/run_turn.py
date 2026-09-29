@@ -2399,6 +2399,50 @@ class GatewayTurnMixin:
         disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None
         return enabled, disabled
 
+    async def _deliver_background_result(
+        self, *, prompt: str, response: str, adapter: "BasePlatformAdapter",
+        source: "SessionSource", thread_metadata: Optional[dict],
+    ) -> None:
+        """Deliver a background task's final text/media output (shared by the local and proxy
+        dispatch paths)."""
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+        images, media_files, text_content = [], [], ""
+        if response:
+            media_files, response = adapter.extract_media(response)
+            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            images, text_content = adapter.extract_images(response)
+        if text_content:
+            await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=thread_metadata)
+        elif not images and not media_files:
+            await adapter.send(
+                chat_id=source.chat_id, content=header + "(No response generated)", metadata=thread_metadata,
+            )
+        for image_url, alt_text in (images or []):
+            with suppress(Exception):
+                await adapter.send_image(
+                    chat_id=source.chat_id, image_url=image_url, caption=alt_text, metadata=thread_metadata,
+                )
+        # Route each media file by type (voice bubble / video / image / document), as the
+        # streaming + kanban paths do.
+        from gateway.platforms.base import should_send_media_as_audio as _should_send_media_as_audio
+        from gateway.run_notifications import _IMAGE_EXTS, _VIDEO_EXTS
+        for media_path, _is_voice in (media_files or []):
+            _ext = os.path.splitext(media_path)[1].lower()
+            with suppress(Exception):
+                if _should_send_media_as_audio(source.platform, _ext, _is_voice):
+                    await adapter.send_voice(
+                        chat_id=source.chat_id, audio_path=media_path, metadata=thread_metadata,
+                        is_voice=_is_voice,
+                    )
+                else:
+                    sender, key = (
+                        (adapter.send_video, "video_path") if _ext in _VIDEO_EXTS
+                        else (adapter.send_image_file, "image_path") if _ext in _IMAGE_EXTS
+                        else (adapter.send_document, "file_path")
+                    )
+                    await sender(chat_id=source.chat_id, metadata=thread_metadata, **{key: media_path})
+
     async def _run_background_task_inner(
         self, prompt: str, source: "SessionSource", task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[List[str]] = None,
@@ -2418,7 +2462,100 @@ class GatewayTurnMixin:
             return
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
+        from gateway.proxy_admission import PROXY_REQUIRED_KEY, ProxyPolicyError, gateway_proxy_required
+
         try:
+            proxy_required = gateway_proxy_required()
+        except ProxyPolicyError as exc:
+            with suppress(Exception):
+                await adapter.send(
+                    source.chat_id,
+                    f"⚠️ {PROXY_REQUIRED_KEY} could not be confirmed safe — refusing this background "
+                    f"task: {exc}",
+                    metadata=_thread_metadata,
+                )
+            return
+
+        try:
+            proxy_url = self._get_proxy_url()
+        except Exception:
+            # A malformed served-profile URL or a resolver fault must never leak its raw exception
+            # text, nor fall through to local execution while the URL is unresolved.
+            with suppress(Exception):
+                await adapter.send(
+                    source.chat_id,
+                    f"⚠️ {PROXY_REQUIRED_KEY} could not be resolved safely — refusing this background task.",
+                    metadata=_thread_metadata,
+                )
+            return
+
+        if not proxy_url and proxy_required:
+            with suppress(Exception):
+                await adapter.send(
+                    source.chat_id,
+                    f"⚠️ {PROXY_REQUIRED_KEY} is set but no usable proxy URL is configured — "
+                    "refusing local execution for this background task.",
+                    metadata=_thread_metadata,
+                )
+            return
+
+        try:
+            if proxy_url:
+                # A configured proxy is never bypassed for local execution — same rule as an
+                # ordinary turn (``_run_agent_inner``). No foreground session identity: a fresh,
+                # isolated transcript keyed only by task_id, no history/pending-image buffer.
+                proxy_message: Any = prompt
+                if media_urls or media_types:
+                    from gateway.background_proxy import (
+                        build_background_native_content, validate_background_media,
+                    )
+                    deny_reason = validate_background_media(media_urls, media_types)
+                    if deny_reason:
+                        with suppress(Exception):
+                            await adapter.send(
+                                source.chat_id,
+                                f"⚠️ Background task attachment refused: {deny_reason}.",
+                                metadata=_thread_metadata,
+                            )
+                        return
+                    native_content = build_background_native_content(prompt, media_urls)
+                    if native_content is None:
+                        with suppress(Exception):
+                            await adapter.send(
+                                source.chat_id,
+                                "⚠️ Background task attachment could not be prepared for delivery.",
+                                metadata=_thread_metadata,
+                            )
+                        return
+                    proxy_message = native_content
+
+                result = await self._run_agent_via_proxy(
+                    message=proxy_message, context_prompt="", history=[], source=source,
+                    session_id=task_id, session_key=None, event_message_id=event_message_id,
+                    background=True,
+                )
+                if not (result and result.get("completed")):
+                    # Uncertain/failed remote run: never claim success, never repeat the upstream's
+                    # private error body, and never invite a retry — one fixed notice only. Any
+                    # send failure here is swallowed rather than falling into the outer except
+                    # below, which would fire a second, contradictory delivery.
+                    with suppress(Exception):
+                        await adapter.send(
+                            source.chat_id,
+                            "⚠️ Background task completion is unknown.",
+                            metadata=_thread_metadata,
+                        )
+                    return
+                response = result.get("final_response", "") if result else ""
+                if response:
+                    response = repair_explicit_computer_use_media_paths(response, result.get("messages", []))
+                with suppress(Exception):
+                    await self._deliver_background_result(
+                        prompt=prompt, response=response, adapter=adapter,
+                        source=source, thread_metadata=_thread_metadata,
+                    )
+                return
+
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
             if not runtime_kwargs.get("api_key"):
@@ -2494,43 +2631,10 @@ class GatewayTurnMixin:
             if response:
                 response = repair_explicit_computer_use_media_paths(response, result.get("messages", []))
 
-            preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-            header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
-            images, media_files, text_content = [], [], ""
-            if response:
-                media_files, response = adapter.extract_media(response)
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-                images, text_content = adapter.extract_images(response)
-            if text_content:
-                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
-            elif not images and not media_files:
-                await adapter.send(
-                    chat_id=source.chat_id, content=header + "(No response generated)", metadata=_thread_metadata,
-                )
-            for image_url, alt_text in (images or []):
-                with suppress(Exception):
-                    await adapter.send_image(
-                        chat_id=source.chat_id, image_url=image_url, caption=alt_text, metadata=_thread_metadata,
-                    )
-            # Route each media file by type (voice bubble / video / image / document), as the
-            # streaming + kanban paths do.
-            from gateway.platforms.base import should_send_media_as_audio as _should_send_media_as_audio
-            from gateway.run_notifications import _IMAGE_EXTS, _VIDEO_EXTS
-            for media_path, _is_voice in (media_files or []):
-                _ext = os.path.splitext(media_path)[1].lower()
-                with suppress(Exception):
-                    if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                        await adapter.send_voice(
-                            chat_id=source.chat_id, audio_path=media_path, metadata=_thread_metadata,
-                            is_voice=_is_voice,
-                        )
-                    else:
-                        sender, key = (
-                            (adapter.send_video, "video_path") if _ext in _VIDEO_EXTS
-                            else (adapter.send_image_file, "image_path") if _ext in _IMAGE_EXTS
-                            else (adapter.send_document, "file_path")
-                        )
-                        await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
+            await self._deliver_background_result(
+                prompt=prompt, response=response, adapter=adapter,
+                source=source, thread_metadata=_thread_metadata,
+            )
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
@@ -2711,7 +2815,7 @@ class GatewayTurnMixin:
 
     @staticmethod
     def _proxy_error_result(text: str) -> Dict[str, Any]:
-        return {"final_response": text, "messages": [], "api_calls": 0, "tools": []}
+        return {"final_response": text, "messages": [], "api_calls": 0, "tools": [], "completed": False}
 
     def _proxy_stream_consumer(self, source: "SessionSource", event_message_id, _thread_metadata, _run_still_current):
         """Platform stream consumer for the proxy path when streaming is enabled, else ``None``."""
@@ -2751,7 +2855,7 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: "SessionSource", session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
-        scheduled_heartbeat: bool = False,
+        scheduled_heartbeat: bool = False, background: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
@@ -2818,27 +2922,37 @@ class GatewayTurnMixin:
         body = {"model": "hermes-agent", "messages": api_messages, "stream": True}
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
+        # A background dispatch has no live chat surface to stream into or show typing for — same
+        # quiet presentation as scheduled_heartbeat, but named for what it actually is.
+        _quiet_presentation = scheduled_heartbeat or background
         _stream_consumer = (
-            None if scheduled_heartbeat
+            None if _quiet_presentation
             else self._proxy_stream_consumer(source, event_message_id, _thread_metadata, _run_still_current)
         )
         stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
 
         _adapter = self._delivery_adapter_for(source)
-        if _adapter and not scheduled_heartbeat:
+        if _adapter and not _quiet_presentation:
             with suppress(Exception):
                 await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
 
         full_response = ""
         _start = time.time()
         saw_done = False
+        # Set only by the terminal chunk (the one carrying a non-null finish_reason); a stream that
+        # never sends one — transport EOF, malformed final frame — must never be read as "stop".
+        _final_finish_reason: Optional[str] = None
+        # Latched once any frame signals failure (top-level ``error``, ``hermes`` extras claiming
+        # failed/partial/completed=false/error, or a non-"stop" finish_reason) — a later frame
+        # claiming "stop" must never clear it (see adversarial SSE terminal-frame cases).
+        _latched_failure = False
 
         def _consume_sse_line(line: str) -> bool:
             """Parse one SSE line into full_response; True when the terminal ``[DONE]`` was seen.
 
             Malformed frames (bad JSON, ``choices: [null]``, non-dict deltas) are skipped —
             one bad chunk must not abort the whole stream."""
-            nonlocal full_response
+            nonlocal full_response, _final_finish_reason, _latched_failure
             line = line.strip()
             if not line.startswith("data: "):
                 return False
@@ -2846,10 +2960,36 @@ class GatewayTurnMixin:
             if data.strip() == "[DONE]":
                 return True
             try:
-                choices = json.loads(data).get("choices") or []
-                content = choices[0].get("delta", {}).get("content", "") if choices else ""
+                parsed = json.loads(data)
+                if not isinstance(parsed, dict):
+                    return False
+                if parsed.get("error") is not None:
+                    _latched_failure = True
+                if "hermes" in parsed:
+                    hermes_extra = parsed["hermes"]
+                    if not isinstance(hermes_extra, dict) or not (
+                        type(hermes_extra.get("completed")) is bool
+                        and hermes_extra.get("completed") is True
+                        and type(hermes_extra.get("failed")) is bool
+                        and hermes_extra.get("failed") is False
+                        and type(hermes_extra.get("partial")) is bool
+                        and hermes_extra.get("partial") is False
+                        and hermes_extra.get("error") is None
+                    ):
+                        _latched_failure = True
+                choices = parsed.get("choices") or []
+                choice0 = choices[0] if choices else {}
+                if not isinstance(choice0, dict):
+                    return False
+                delta = choice0.get("delta") or {}
+                content = delta.get("content", "") if isinstance(delta, dict) else ""
+                frame_finish_reason = choice0.get("finish_reason")
             except (json.JSONDecodeError, TypeError, AttributeError, IndexError):
                 return False
+            if frame_finish_reason:
+                _final_finish_reason = frame_finish_reason
+                if frame_finish_reason != "stop":
+                    _latched_failure = True
             if content:
                 full_response += content
                 if _stream_consumer:
@@ -2921,6 +3061,11 @@ class GatewayTurnMixin:
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
+        # No DONE (transport/protocol EOF) is never complete; a DONE whose terminal frame carried
+        # a non-"stop" finish_reason (native failure/truncation) or no finish_reason at all is the
+        # same — only an explicit "stop" with no failure latched anywhere in the stream is a
+        # confirmed, successful completion.
+        _completed = saw_done and _final_finish_reason == "stop" and not _latched_failure
         return {
             "final_response": full_response or "(No response from remote agent)",
             "messages": [
@@ -2932,6 +3077,7 @@ class GatewayTurnMixin:
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "completed": _completed,
         }
 
     async def _run_agent(

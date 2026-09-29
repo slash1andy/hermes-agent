@@ -1,8 +1,8 @@
-"""Required-proxy admission for ordinary gateway turns.
+"""Required-proxy admission for ordinary gateway turns and background tasks.
 
 ``gateway.proxy_required`` on THIS process's own launch config — its process-root
 ``config.yaml`` (never a served profile's), read via ``get_routing_process_hermes_home`` — decides
-whether an ordinary turn may fall back to local execution when no usable proxy URL is configured.
+whether an ordinary turn or ``/bg`` task may fall back to local execution when no usable proxy URL is configured.
 Missing key: current default (``False``, not required) explicitly allows an ordinary turn to run
 locally when no proxy URL resolves. An explicit ``proxy_required: false`` does the same. Any
 explicit non-boolean value, a ``gateway`` section present but not a mapping, or
@@ -12,8 +12,8 @@ never silently permit local execution. The URL that is ultimately dispatched to 
 used) still comes from the resolving profile's own scope (``GATEWAY_PROXY_URL`` / ``gateway.proxy_url``);
 only the require/refuse POLICY itself is pinned to the process root.
 
-Configuration guard, not a proxy/URL validator — it only answers whether this ordinary turn may
-skip the remote proxy path; the exact proxy URL resolution and dispatch stay in
+Configuration guard, not a proxy/URL validator — it only answers whether this ordinary turn or
+``/bg`` task may skip the remote proxy path; the exact proxy URL resolution and dispatch stay in
 ``gateway/run_turn.py::_get_proxy_url`` / ``_run_agent_via_proxy``.
 """
 

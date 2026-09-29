@@ -826,7 +826,7 @@ Proxy mode is configured on the **container side** (the thin gateway):
 | `GATEWAY_PROXY_URL` | URL of the remote Hermes API server (e.g., `http://192.168.1.100:8642`) |
 | `GATEWAY_PROXY_KEY` | Bearer token for authentication (must match `API_SERVER_KEY` on the host) |
 | `gateway.proxy_url` | Same as `GATEWAY_PROXY_URL` but in `config.yaml` |
-| `gateway.proxy_required` | `config.yaml` boolean (default `false`). When `true` on this container's own launch config, an ordinary turn is refused instead of running locally if no usable proxy URL resolves — it does not cover background/media work or other execution entry points. |
+| `gateway.proxy_required` | `config.yaml` boolean (default `false`). When `true` on this container's own launch config, an ordinary turn or `/bg` task is refused instead of running locally if no usable proxy URL resolves. A configured proxy runs `/bg` remotely with a separate task transcript and one final result rather than live streaming; explicit own-profile local images are forwarded natively. Unsupported audio/files and invalid images are refused, not silently dropped; incomplete or errored remote results are not reported as successful, and there is no local fallback. This is not whole execution confinement: other slash commands, hygiene, raw API, and runtime OS boundaries remain distinct. |
 
 The host side needs:
 
