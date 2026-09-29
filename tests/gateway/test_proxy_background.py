@@ -3,9 +3,12 @@
   - group 1: a required root policy with no usable proxy URL must refuse a background dispatch
     before any local provider/model preparation; absent/explicit-false policy leaves the existing
     local-positive ``/bg`` path unaffected. Driven against a REAL process-root ``config.yaml``.
-  - group 2: a background dispatch with a configured, required proxy must reach the real native
+  - group 2: a background dispatch with a configured proxy URL must reach the real native
     receiver exactly once per task (A/B/A across two owners) and never touch local runtime prep,
-    with the foreground session's transcript/pending-images left untouched.
+    with the foreground session's transcript/pending-images left untouched. (This fixture hosts
+    the native receiver's ``_create_agent`` in the same process as the dispatch, so its root
+    policy is left non-required -- see ``test_proxy_executor_process.py`` for the two-process
+    required-proxy admission policy itself.)
 
   - group 3: explicit attached-image content forwarded through the real
     ``agent.image_routing.build_native_content_parts`` / native receiver chain (not a hand-built
@@ -255,10 +258,13 @@ async def test_background_dispatches_via_real_native_proxy_a_b_a(monkeypatch, tm
         tmp_path, "client-b",
         extra_env={"GATEWAY_PROXY_URL": f"{base_url}/p/owner-b", "GATEWAY_PROXY_KEY": key_owner_b})
 
-    # This process's OWN launch config (pinned, real root config.yaml, not a mocked reader)
-    # declares the proxy required.
-    (home_client_a / "config.yaml").write_text(
-        yaml.safe_dump({"gateway": {"proxy_required": True}}), encoding="utf-8")
+    # This process's OWN launch config (pinned, real root config.yaml, not a mocked reader) is
+    # deliberately left WITHOUT ``gateway.proxy_required: true``: this fixture hosts both the
+    # background dispatch AND the native receiver's ``_create_agent`` in the SAME process, and
+    # ``admit_local_api_agent_creation`` reads that same pinned process root -- a required policy
+    # here would refuse the native receiver's own construction, not just this dispatch's local
+    # fallback. This test exercises real in-process wire/profile forwarding for ``/bg``, not the
+    # two-process required-proxy admission policy (see ``test_proxy_executor_process.py``).
     hermes_constants.pin_process_hermes_home(str(home_client_a))
 
     profiles = {
@@ -431,8 +437,9 @@ async def test_background_dispatch_forwards_native_image_content_through_real_pr
     home_client_a = _profile_home(
         tmp_path, "client-image",
         extra_env={"GATEWAY_PROXY_URL": f"{base_url}/p/owner-image", "GATEWAY_PROXY_KEY": key_owner_a})
-    (home_client_a / "config.yaml").write_text(
-        yaml.safe_dump({"gateway": {"proxy_required": True}}), encoding="utf-8")
+    # No ``gateway.proxy_required: true`` here either: the native receiver's ``_create_agent``
+    # runs in this SAME process (see the group-2 fixture comment above for why a required root
+    # policy would refuse it, not just the dispatch's local fallback).
     hermes_constants.pin_process_hermes_home(str(home_client_a))
 
     # The client's OWN image_cache -- the real on-disk location ``get_image_cache_dir()`` resolves

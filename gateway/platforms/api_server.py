@@ -27,6 +27,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from gateway.proxy_admission import ApiAgentAdmissionDenied
+
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
@@ -952,6 +954,11 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
+        from gateway.proxy_admission import admit_local_api_agent_creation
+        try:
+            admit_local_api_agent_creation()
+        except ApiAgentAdmissionDenied as exc:
+            return _error_response(str(exc), 503 if exc.malformed else 403, code="gateway.proxy_required")
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
@@ -2215,6 +2222,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
+        # Recheck here (not only at HTTP admission): this is the shared creation boundary every
+        # caller reaches — including /v1/runs and background executors that never went through
+        # ``_admit_api_agent_request`` — and an admitted request can outlive a policy-change race.
+        # Raises ``ApiAgentAdmissionDenied`` (never returns) so a caller that forgets to check a
+        # return value still fails closed; callers translate it explicitly, never treating it as
+        # the unrelated ``_ProviderAuthResolutionError`` completed-looking text reply.
+        from gateway.proxy_admission import admit_local_api_agent_creation
+        admit_local_api_agent_creation()
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
@@ -4087,6 +4102,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     return (
                         {"final_response": exc.user_text(), "messages": [],
                          "api_calls": 0, "tools": [],
+                         **({"_notification_presentation_suppressed": True} if muted else {})},
+                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                except ApiAgentAdmissionDenied as exc:
+                    # Late policy-race / direct-caller denial at _create_agent: unlike
+                    # _ProviderAuthResolutionError above, this must never look like a completed
+                    # turn — completed/failed carry the real outcome so terminal_run_status()
+                    # (and any caller reading these fields directly) reports it as failed, not
+                    # a successful empty answer. No local/proxy retry or fallback.
+                    logger.warning("API agent creation refused for session=%s: %s",
+                                   session_id or "", exc)
+                    return (
+                        {"final_response": "", "messages": [], "api_calls": 0, "tools": [],
+                         "completed": False, "failed": True, "error": str(exc),
                          **({"_notification_presentation_suppressed": True} if muted else {})},
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
                 except Exception as exc:
