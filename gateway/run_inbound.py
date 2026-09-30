@@ -1004,6 +1004,19 @@ class GatewayInboundMixin:
     async def _hm_run_exec_quick_command(self, command: str, exec_cmd: str) -> str:
         """Run a ``type: exec`` quick command in the gateway process (30 s cap, sanitized env — the
         gateway process has every API key in os.environ; output is redacted too)."""
+        from gateway.proxy_admission import gateway_proxy_required
+
+        try:
+            if gateway_proxy_required():
+                return "Quick command execution refused by gateway proxy policy."
+        except Exception:
+            return "Quick command execution refused because gateway proxy policy is unavailable."
+        try:
+            proxy_url = self._get_proxy_url()
+        except Exception:
+            return "Quick command execution unsupported because gateway proxy configuration is unavailable."
+        if proxy_url:
+            return "Quick command execution unsupported when gateway proxy mode is configured."
         try:
             from tools.environments.local import build_subprocess_env
             proc = await asyncio.create_subprocess_shell(
@@ -1045,7 +1058,8 @@ class GatewayInboundMixin:
                 exec_cmd = qcmd.get("command", "")
                 if not exec_cmd:
                     return True, f"Quick command '/{command}' has no command defined.", command
-                return True, await self._hm_run_exec_quick_command(command, exec_cmd), command
+                async with self._async_profile_scope_for_source(source):
+                    return True, await self._hm_run_exec_quick_command(command, exec_cmd), command
             if qtype != "alias":
                 return True, f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias').", command
             new_command = self._hm_expand_alias_quick_command(event, qcmd)
