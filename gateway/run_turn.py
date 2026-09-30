@@ -2360,6 +2360,21 @@ class GatewayTurnMixin:
 
     def _format_session_info(self) -> str:
         """Model / provider / context-length / endpoint block so users can spot bad context detection."""
+        from gateway.proxy_admission import ProxyPolicyError, gateway_proxy_required
+
+        try:
+            proxy_required = gateway_proxy_required()
+        except ProxyPolicyError:
+            return "◆ Model: unavailable (gateway proxy policy could not be resolved safely)"
+        if proxy_required:
+            return "◆ Model: unavailable (local model details not resolved because gateway.proxy_required)"
+        try:
+            proxy_url = self._get_proxy_url()
+        except Exception:
+            return "◆ Model: unavailable (gateway proxy configuration could not be resolved safely)"
+        if proxy_url:
+            return "◆ Model: details managed by gateway proxy"
+
         from gateway.run import _resolve_gateway_model_context
         resolved = _resolve_gateway_model_context()
         context_length = resolved.context_length

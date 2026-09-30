@@ -1,7 +1,9 @@
 """Tests for GatewayRunner._format_session_info — session config surfacing."""
 
 import pytest
+import yaml
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from gateway.run import GatewayRunner
 
@@ -150,4 +152,69 @@ class TestResetNoticeSessionInfo:
         assert "profile-model" in info
         assert "anthropic" in info
         assert "base-model" not in info
+
+    @pytest.mark.parametrize(
+        "root_config, proxy_url, should_resolve, expect_proxy",
+        [
+            ({"gateway": {"proxy_required": True}}, None, False, False),
+            ("gateway: [malformed", None, False, False),
+            ({"gateway": {"proxy_required": False}}, "http://proxy.test/v1", False, True),
+            ({"gateway": {"proxy_required": False}}, None, True, False),
+            ({}, None, True, False),
+        ],
+        ids=["root-true", "root-malformed", "root-false-configured-proxy",
+             "root-false-absent-proxy", "absent-root-policy-no-url"],
+    )
+    def test_reset_notice_uses_root_policy_and_real_profile_scope(
+        self, runner, tmp_path, monkeypatch, root_config, proxy_url, should_resolve, expect_proxy
+    ):
+        import hermes_constants
+        from agent import secret_scope as ss
+        from gateway.run import _profile_runtime_scope
+
+        process_root = tmp_path / "process-root"
+        served_home = tmp_path / "profiles" / "planner"
+        process_root.mkdir()
+        served_home.mkdir(parents=True)
+        if isinstance(root_config, str):
+            (process_root / "config.yaml").write_text(root_config)
+        else:
+            (process_root / "config.yaml").write_text(yaml.safe_dump(root_config))
+        (served_home / "config.yaml").write_text(
+            yaml.safe_dump({
+                "gateway": {"proxy_required": False, **({"proxy_url": proxy_url} if proxy_url else {})},
+                "model": {"default": "served-model"},
+            })
+        )
+        secret_token = ss.set_secret_scope(
+            ss.current_secret_scope(), profile_home=ss.current_secret_scope_home()
+        )
+        try:
+            hermes_constants.pin_process_hermes_home(str(process_root))
+            runner.config = SimpleNamespace(multiplex_profiles=True)
+            monkeypatch.setattr(
+                GatewayRunner, "_resolve_profile_home_for_source", lambda self, source: served_home
+            )
+            calls = []
+
+            def resolve_context():
+                calls.append(True)
+                return SimpleNamespace(
+                    model="local-model", provider="local", base_url="http://127.0.0.1:11434/v1",
+                    context_length=8192, context_source="detected",
+                )
+
+            monkeypatch.setattr("gateway.run._resolve_gateway_model_context", resolve_context)
+            with _profile_runtime_scope(served_home):
+                info = runner._reset_notice_session_info(self._source())
+            assert isinstance(info, str) and info
+            assert len(calls) == int(should_resolve)
+            if not should_resolve:
+                assert "local-model" not in info
+                assert "127.0.0.1" not in info
+            if expect_proxy:
+                assert "proxy" in info.lower()
+        finally:
+            hermes_constants.pin_process_hermes_home(None)
+            ss.reset_secret_scope(secret_token)
 

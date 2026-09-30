@@ -34,10 +34,11 @@ import yaml
 import hermes_constants
 from agent import secret_scope as ss
 from gateway.config import GatewayConfig, Platform
+from gateway.hooks import HookRegistry
 from gateway.platforms.event import MessageEvent
 from gateway.proxy_admission import gateway_proxy_required
 from gateway.run import _profile_runtime_scope
-from gateway.session import build_session_key
+from gateway.session import SessionStore, build_session_key
 from hermes_state import SessionDB
 
 from tests.gateway.test_proxy_background import _RecordingAdapter, _TINY_PNG, _make_background_runner
@@ -98,7 +99,9 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
     the admission gate reads each process's OWN identity, never the other's, and that the
     required-proxy parent exclusively uses the configured proxy for both a foreground A/B/A and a
     background image dispatch, never falling back to local construction. The owner-A executor
-    transcript is explicitly seeded in its native SessionDB before startup."""
+    transcript is explicitly seeded in its native SessionDB before startup. The A2 transcript id
+    is not invented: it comes from a real ``_handle_reset_command`` /new rotation against a real
+    ``SessionStore``/``AsyncSessionStore`` and an empty (no installed hooks) ``HookRegistry``."""
     evidence_path = tmp_path / "evidence.jsonl"
 
     key_owner_a, key_owner_b = "child-owner-a-key", "child-owner-b-key"
@@ -125,6 +128,7 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         owner_a_db.close()
 
     stderr_path = tmp_path / "child-stderr.log"
+    client_runner = None
     proc = _spawn_child(child_root, evidence_path, home_owner_a, home_owner_b, stderr_path)
     try:
         port = await _await_child_ready(proc, stderr_path)
@@ -182,11 +186,31 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         monkeypatch.setattr(vision_tools, "vision_analyze_tool", forbidden_parent_vision)
 
         client_runner = _client_runner()
+        client_runner.config = GatewayConfig(multiplex_profiles=True)
         source = _source()
-        key_a = build_session_key(source, profile="owner-a")
-        key_b = build_session_key(source, profile="owner-b")
+        source.profile = "client-a"
+        key_a = build_session_key(source, profile="client-a")
+        source.profile = "client-b"
+        key_b = build_session_key(source, profile="client-b")
 
         source.profile = "client-a"
+        with _profile_runtime_scope(home_client_a):
+            client_runner.session_store = SessionStore(home_client_a / "sessions", client_runner.config)
+            client_runner.hooks = HookRegistry()
+            seeded_entry = client_runner.session_store.get_or_create_session(source)
+            seeded_entry.session_id = "session-fixture"
+            client_runner.session_store._save()
+            native_db = client_runner.session_store._db_for_key(key_a)
+            native_db.create_session(
+                "session-fixture",
+                source.platform.value,
+                session_key=key_a,
+                chat_id=source.chat_id,
+                user_id=source.user_id,
+                profile_name=source.profile,
+            )
+        pre_reset_session_id = seeded_entry.session_id
+
         # Keep this as a real hygiene call under the owning client profile. Required-proxy
         # admission must preserve the exact payload rather than locally bounding it.
         a1_history_bytes = json.dumps(authored_a1_history, ensure_ascii=False, separators=(",", ":")).encode()
@@ -203,9 +227,26 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         source.profile = "client-b"
         result_b = await client_runner._run_agent(
             "current B", "fixture system", [], source, "session-fixture", session_key=key_b)
+        # -- real /new rotation on the client's own local routing index, never an invented next id.
         source.profile = "client-a"
+        with _profile_runtime_scope(home_client_a):
+            key_before_reset = client_runner._session_key_for_source(source)
+            assert key_before_reset == key_a
+            assert client_runner.session_store._entries[key_a].session_id == pre_reset_session_id
+            await client_runner._handle_reset_command(
+                MessageEvent(text="/new", source=source, message_id="reset-client-a"))
+            key_after_reset = client_runner._session_key_for_source(source)
+        assert key_after_reset == key_before_reset == key_a, "reset rotates the id, never the key"
+        rotated_session_id = client_runner.session_store._entries[key_a].session_id
+        assert rotated_session_id and rotated_session_id != pre_reset_session_id
+        persisted_reset = native_db.get_session_rich_row(rotated_session_id)
+        assert persisted_reset is not None
+        assert persisted_reset["parent_session_id"] == pre_reset_session_id
+
+        source.profile = "client-a"
+        # Intentionally stale wire history must not repopulate the freshly rotated executor SessionDB.
         result_a2 = await client_runner._run_agent(
-            "current A2", "fixture system", [], source, "session-fixture-next", session_key=key_a)
+            "current A2", "fixture system", authored_a1_history, source, rotated_session_id, session_key=key_a)
 
         assert [result["final_response"] for result in (result_a1, result_b, result_a2)] == [
             f"echo:{key_a}:current A1", f"echo:{key_b}:current B", f"echo:{key_a}:current A2",
@@ -278,6 +319,7 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
             if message.get("role") in {"user", "assistant"}
         ]
         assert agent_a1["conversation_history"] == expected_persisted_history
+        assert agent_a2["conversation_history"] == []
         assert [
             {"role": message["role"], "content": message["content"]}
             for message in authored_at_final_model
@@ -293,7 +335,7 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         assert all(r["get_process_hermes_home"] == str(child_root) for r in records)
 
         assert [r["session_id"] for r in (agent_a1, agent_b, agent_a2)] == [
-            "session-fixture", "session-fixture", "session-fixture-next",
+            "session-fixture", "session-fixture", rotated_session_id,
         ]
         assert agent_image["session_id"] == "fixture-image"
         assert agent_image["gateway_session_key"] == key_a
@@ -341,4 +383,6 @@ async def test_required_proxy_admission_real_child_process(tmp_path, monkeypatch
         finally:
             assert proc.stdout is not None
             proc.stdout.close()
+            if client_runner is not None and getattr(client_runner, "session_store", None) is not None:
+                client_runner.session_store.close_all_db_handles()
         assert proc.poll() is not None, "the child process must be reaped, never left as a zombie/orphan"
