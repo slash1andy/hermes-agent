@@ -878,4 +878,6 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 
 The API server also serves as the backend for **gateway proxy mode**. When another Hermes gateway instance is configured with `GATEWAY_PROXY_URL` pointing at this API server, it forwards all messages here instead of running its own agent. This enables split deployments — for example, a Docker container handling Matrix E2EE that relays to a host-side agent.
 
+Proxy quick execution (`type: exec` quick commands) is unsupported and is refused when proxy execution is required, proxy configuration is present, or proxy resolution is unsafe. Preserve required owner executor workflows before rolling out a proxy-only deployment; this guard does not provide remote quick-command execution or a local fallback.
+
 See [Matrix Proxy Mode](../messaging/matrix.md#proxy-mode-e2ee-on-macos) for the full setup guide.
