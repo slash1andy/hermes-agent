@@ -2679,21 +2679,22 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+
+    A caller whose ``expected_run_id`` no longer owns the card gets ``False``
+    with no audit, acceptance record or artifact: rejections are recorded only
+    for the run that owns the card (or a human passing no run id), validated
+    inside the writer reservation of each write.
     """
     now = int(time.time())
-    # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
-    if not _parents_satisfied(conn, task_id):
-        return False
-    from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
-    verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
-    _gate_empty_completion(conn, task_id, result=result, summary=summary)
-    metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
+    prepared = prepare_completion(
+        conn, task_id, result=result, summary=summary, metadata=metadata,
+        created_cards=created_cards, expected_run_id=expected_run_id,
     )
-    handoff_summary = summary if summary is not None else result
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
-    if acceptance is False:
+    if prepared is None:
         return False
+    verified_cards, metadata, acceptance = prepared
+    from hermes_cli.kanban_pr_acceptance_store import record_acceptance
+    handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
@@ -2765,67 +2766,6 @@ def complete_task(
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
-
-
-def _gate_created_cards(
-    conn: sqlite3.Connection, task_id: str, created_cards: Optional[Iterable[str]], preview_text: Optional[str],
-) -> list[str]:
-    """Verify ``created_cards`` BEFORE the main write txn; returns the verified
-    ids. A phantom id is recorded in its own tiny txn (auditable) then raised
-    as :class:`HallucinatedCardsError` without touching task state."""
-    if not created_cards:
-        return []
-    verified_cards, phantom_cards = _verify_created_cards(conn, task_id, created_cards)
-    if phantom_cards:
-        with write_txn(conn):
-            _append_event(
-                conn, task_id, "completion_blocked_hallucination",
-                {
-                    "phantom_cards": phantom_cards,
-                    "verified_cards": verified_cards,
-                    "summary_preview": _first_line(preview_text, 200) or None,
-                },
-            )
-        raise HallucinatedCardsError(phantom_cards, task_id)
-    return verified_cards
-
-
-def _substantive_text(value: Optional[str]) -> bool:
-    return bool(value is not None and str(value).strip())
-
-
-def _gate_empty_completion(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    result: Optional[str],
-    summary: Optional[str],
-) -> None:
-    """Refuse a completion that would leave the card with no evidence.
-
-    Review approvals are exempt: a human vouches for the card and
-    ``_REVIEW_APPROVED_NOTE`` is the documented record.
-    """
-    row = conn.execute(
-        "SELECT status, result FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        return
-    if row["status"] == "review":
-        return
-    stored = row["result"]
-    if _substantive_text(result) or _substantive_text(summary) or _substantive_text(stored):
-        return
-    with write_txn(conn):
-        _append_event(
-            conn, task_id, "completion_blocked_empty_result",
-            {
-                "result_preview": _first_line(result, 200) or None,
-                "summary_preview": _first_line(summary, 200) or None,
-            },
-        )
-    raise EmptyCompletionError(task_id)
 
 
 def _stage_completion_artifacts(
@@ -4429,6 +4369,7 @@ from hermes_cli.kanban_db_connect import (
     init_db,
     write_txn,
 )
+from hermes_cli.kanban_db_completion import prepare_completion
 from hermes_cli.kanban_db_workspace import (
     _cleanup_workspace,
     _is_managed_scratch_path,
