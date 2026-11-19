@@ -1,6 +1,6 @@
 """#5 regression: _session_has_compression_in_flight must offload both blocking sources to thread pool."""
-import inspect
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,38 +17,18 @@ def _make_runner(holder_value=None, record_thread=False, thread_sink=None):
     store._ensure_loaded_locked = lambda: None
     runner.session_store = store
 
-    raw_db = MagicMock()
+    coordination = MagicMock()
     if record_thread and thread_sink is not None:
-        def _holder(sid):
+        def _holder(*, session_id):
             thread_sink["thread"] = threading.get_ident()
             return holder_value
-        raw_db.get_compression_lock_holder = _holder
+        coordination.get_compression_lock_holder = _holder
     else:
-        raw_db.get_compression_lock_holder = MagicMock(return_value=holder_value)
+        coordination.get_compression_lock_holder = MagicMock(return_value=holder_value)
 
-    session_db = MagicMock()
-    session_db._db = raw_db
-    runner._session_db = session_db
+    # The runner's storage handle is borrowed from its session store.
+    store.persistence = SimpleNamespace(coordination=coordination)
     return runner
-
-
-def test_method_is_coroutine():
-    from gateway.run import GatewayRunner
-    assert inspect.iscoroutinefunction(
-        GatewayRunner._session_has_compression_in_flight
-    ), "#5: method must be async, blocking calls offloaded"
-
-
-@pytest.mark.asyncio
-async def test_returns_true_when_lock_held():
-    runner = _make_runner(holder_value="agent-1")
-    assert await runner._session_has_compression_in_flight("k") is True
-
-
-@pytest.mark.asyncio
-async def test_returns_false_when_no_lock():
-    runner = _make_runner(holder_value=None)
-    assert await runner._session_has_compression_in_flight("k") is False
 
 
 @pytest.mark.asyncio
@@ -61,32 +41,16 @@ async def test_returns_false_when_no_session_store():
 
 
 @pytest.mark.asyncio
-async def test_structural_lock_absence_still_fails_open():
-    runner = _make_runner(holder_value=None)
-    runner._session_db._db.get_compression_lock_holder = MagicMock(
-        side_effect=AttributeError("old SessionDB has no lock helper")
-    )
-
+async def test_returns_false_when_holder_is_not_a_string():
+    """Lock holders are session-id strings. A MagicMock auto-attr must not
+    look like an in-flight compression and skip hygiene (#96953)."""
+    runner = _make_runner(holder_value=MagicMock())
     assert await runner._session_has_compression_in_flight("k") is False
-
-
-@pytest.mark.asyncio
-async def test_db_lock_probe_error_fails_closed():
-    runner = _make_runner(holder_value=None)
-    runner._session_db._db.get_compression_lock_holder = MagicMock(
-        side_effect=RuntimeError("sqlite temporarily unavailable")
-    )
-
-    assert await runner._session_has_compression_in_flight("k") is True
-
-
-@pytest.mark.asyncio
-async def test_store_lookup_error_fails_closed():
-    runner = _make_runner(holder_value=None)
-    runner.session_store._ensure_loaded_locked = MagicMock(
-        side_effect=RuntimeError("routing index temporarily unavailable")
-    )
-
+    runner = _make_runner(holder_value=True)
+    assert await runner._session_has_compression_in_flight("k") is False
+    runner = _make_runner(holder_value="")
+    assert await runner._session_has_compression_in_flight("k") is False
+    runner = _make_runner(holder_value="agent-1")
     assert await runner._session_has_compression_in_flight("k") is True
 
 

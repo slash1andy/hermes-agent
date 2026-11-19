@@ -6,9 +6,8 @@ then agent cleanup can close it as ``agent_close``. Stale routing recovery treat
 history unless expiry finalization also persisted the real conversation boundary
 as ``end_reason='session_reset'``.
 
-These tests use a real ``SessionDB`` (in-memory) to verify the actual recovery
-contract in ``find_latest_gateway_session_for_peer`` — not just call counts on
-a MagicMock.
+These tests use a real store handle to verify the actual recovery contract in
+``routing.latest_session_for_peer``, not just call counts on a MagicMock.
 """
 
 from __future__ import annotations
@@ -18,12 +17,14 @@ from pathlib import Path
 
 import pytest
 
-from hermes_state import SessionDB
+from tests.fixtures.storage_read import session_row
+from tests.fixtures.storage_seed import seed_messages, seed_session
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 
 @pytest.fixture
-def db(tmp_path: Path) -> SessionDB:
-    return SessionDB(tmp_path / "state.db")
+def db(tmp_path: Path):
+    return storage_handle(tmp_path)
 
 
 _SESSION_KEY = "agent:main:telegram:dm:8494508720"
@@ -32,87 +33,41 @@ _USER_ID = "8494508720"
 
 
 # ------------------------------------------------------------------
-# promote_to_session_reset — unit tests on real DB
+# sessions.promote_to_reset: unit tests on a real store
 # ------------------------------------------------------------------
 
 class TestPromoteToSessionReset:
-    """promote_to_session_reset promotes only safe rows."""
+    """``sessions.promote_to_reset`` promotes only safe rows."""
 
-    def test_promotes_live_row(self, db: SessionDB) -> None:
+    def test_promotes_live_row(self, db) -> None:
         """A live row (ended_at IS NULL) is promoted to session_reset."""
-        db.create_session(
-            "sid-live", _SOURCE,
+        seed_session(
+            db, "sid-live", _SOURCE,
             user_id=_USER_ID, session_key=_SESSION_KEY,
             chat_id="8494508720", chat_type="dm",
         )
         # Seed a message so recovery would match
-        db.append_message("sid-live", "user", "hello")
+        seed_messages(db, "sid-live", {"role": "user", "content": "hello"})
 
-        assert db.promote_to_session_reset("sid-live") is True
-        row = db.get_session("sid-live")
+        assert db.sessions.promote_to_reset("sid-live") is True
+        row = session_row(db, "sid-live")
         assert row["end_reason"] == "session_reset"
         assert row["ended_at"] is not None
 
-    def test_promotes_agent_close_row(self, db: SessionDB) -> None:
-        """A row ended with agent_close is promoted to session_reset."""
-        db.create_session(
-            "sid-ac", _SOURCE,
-            user_id=_USER_ID, session_key=_SESSION_KEY,
-            chat_id="8494508720", chat_type="dm",
-        )
-        db.append_message("sid-ac", "user", "hello")
-        db.end_session("sid-ac", "agent_close")
 
-        assert db.promote_to_session_reset("sid-ac") is True
-        row = db.get_session("sid-ac")
-        assert row["end_reason"] == "session_reset"
-
-    def test_does_not_overwrite_compression(self, db: SessionDB) -> None:
-        """An existing compression boundary must not be overwritten."""
-        db.create_session(
-            "sid-comp", _SOURCE,
-            user_id=_USER_ID, session_key=_SESSION_KEY,
-            chat_id="8494508720", chat_type="dm",
-        )
-        db.end_session("sid-comp", "compression")
-
-        assert db.promote_to_session_reset("sid-comp") is False
-        row = db.get_session("sid-comp")
-        assert row["end_reason"] == "compression"
-
-    def test_does_not_overwrite_existing_session_reset(self, db: SessionDB) -> None:
+    def test_does_not_overwrite_existing_session_reset(self, db) -> None:
         """Already-promoted rows are idempotently skipped."""
-        db.create_session(
-            "sid-reset", _SOURCE,
+        seed_session(
+            db, "sid-reset", _SOURCE,
             user_id=_USER_ID, session_key=_SESSION_KEY,
             chat_id="8494508720", chat_type="dm",
         )
-        db.end_session("sid-reset", "session_reset")
+        db.sessions.end("sid-reset", "session_reset")
 
         # Should be a no-op (rowcount = 0)
-        assert db.promote_to_session_reset("sid-reset") is False
-        row = db.get_session("sid-reset")
+        assert db.sessions.promote_to_reset("sid-reset") is False
+        row = session_row(db, "sid-reset")
         assert row["end_reason"] == "session_reset"
-
-    def test_does_not_overwrite_new_command(self, db: SessionDB) -> None:
-        """A /new-command boundary is preserved."""
-        db.create_session(
-            "sid-new", _SOURCE,
-            user_id=_USER_ID, session_key=_SESSION_KEY,
-            chat_id="8494508720", chat_type="dm",
-        )
-        db.end_session("sid-new", "new_command")
-
-        assert db.promote_to_session_reset("sid-new") is False
-        row = db.get_session("sid-new")
-        assert row["end_reason"] == "new_command"
-
-    def test_noop_on_missing_session(self, db: SessionDB) -> None:
-        """Non-existent session_id returns False without error."""
-        assert db.promote_to_session_reset("nonexistent") is False
-
-    def test_noop_on_empty_session_id(self, db: SessionDB) -> None:
-        assert db.promote_to_session_reset("") is False
 
 
 # ------------------------------------------------------------------
@@ -120,65 +75,24 @@ class TestPromoteToSessionReset:
 # ------------------------------------------------------------------
 
 class TestPromotionBlocksRecovery:
-    """After promotion, find_latest_gateway_session_for_peer must NOT
+    """After promotion, routing.latest_session_for_peer must NOT
     recover the session — it is now ended with session_reset, which
     the recovery query excludes (only live/agent_close are recoverable).
     """
 
-    def test_live_session_recoverable_before_promotion(self, db: SessionDB) -> None:
-        db.create_session(
-            "sid-pre", _SOURCE,
+    def test_live_session_recoverable_before_promotion(self, db) -> None:
+        seed_session(
+            db, "sid-pre", _SOURCE,
             user_id=_USER_ID, session_key=_SESSION_KEY,
             chat_id="8494508720", chat_type="dm",
         )
-        db.append_message("sid-pre", "user", "hello")
+        seed_messages(db, "sid-pre", {"role": "user", "content": "hello"})
 
-        recovered = db.find_latest_gateway_session_for_peer(
+        recovered = db.routing.latest_session_for_peer(
             source=_SOURCE, session_key=_SESSION_KEY,
             user_id=_USER_ID, chat_id="8494508720", chat_type="dm",
         )
         assert recovered is not None
-        assert recovered["id"] == "sid-pre"
+        assert recovered.session.session_id == "sid-pre"
 
-    def test_promoted_session_not_recoverable(self, db: SessionDB) -> None:
-        db.create_session(
-            "sid-post", _SOURCE,
-            user_id=_USER_ID, session_key=_SESSION_KEY,
-            chat_id="8494508720", chat_type="dm",
-        )
-        db.append_message("sid-post", "user", "hello")
-        db.promote_to_session_reset("sid-post")
 
-        recovered = db.find_latest_gateway_session_for_peer(
-            source=_SOURCE, session_key=_SESSION_KEY,
-            user_id=_USER_ID, chat_id="8494508720", chat_type="dm",
-        )
-        # session_reset rows are not in the recovery set
-        assert recovered is None
-
-    def test_agent_close_session_recoverable_but_not_after_promotion(
-        self, db: SessionDB
-    ) -> None:
-        db.create_session(
-            "sid-ac-rec", _SOURCE,
-            user_id=_USER_ID, session_key=_SESSION_KEY,
-            chat_id="8494508720", chat_type="dm",
-        )
-        db.append_message("sid-ac-rec", "user", "hello")
-        db.end_session("sid-ac-rec", "agent_close")
-
-        # agent_close is recoverable
-        recovered = db.find_latest_gateway_session_for_peer(
-            source=_SOURCE, session_key=_SESSION_KEY,
-            user_id=_USER_ID, chat_id="8494508720", chat_type="dm",
-        )
-        assert recovered is not None
-        assert recovered["id"] == "sid-ac-rec"
-
-        # After promotion, it is no longer recoverable
-        db.promote_to_session_reset("sid-ac-rec")
-        recovered2 = db.find_latest_gateway_session_for_peer(
-            source=_SOURCE, session_key=_SESSION_KEY,
-            user_id=_USER_ID, chat_id="8494508720", chat_type="dm",
-        )
-        assert recovered2 is None

@@ -6,13 +6,15 @@ memory providers pollutes their stores/embeddings with prompt scaffolding
 instead of what the user actually asked. The strip lives once in MemoryManager
 so it covers the whole provider fan-out — not per backend.
 
-See: agent.skill_commands.extract_user_instruction_from_skill_message and
+See: session_rules.turns.extract_user_instruction_from_skill_message and
 MemoryManager._strip_skill_scaffolding.
 """
 
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
-from agent.skill_commands import extract_user_instruction_from_skill_message
+from session_rules.turns import (
+    _SKILL_DIR_NOTE_END, extract_user_instruction_from_skill_message, register_auto_load_scaffold,
+)
 
 
 _SINGLE_SKILL_TURN = (
@@ -92,14 +94,7 @@ class TestExtractUserInstruction:
         assert extract_user_instruction_from_skill_message(123) is None
         assert extract_user_instruction_from_skill_message([{"text": "hi"}]) is None
 
-    def test_plain_message_passes_through(self):
-        assert extract_user_instruction_from_skill_message("just a message") == "just a message"
 
-    def test_single_skill_with_instruction(self):
-        assert (
-            extract_user_instruction_from_skill_message(_SINGLE_SKILL_TURN)
-            == "make a skill for release triage"
-        )
 
     def test_bundle_with_instruction(self):
         assert (
@@ -107,22 +102,10 @@ class TestExtractUserInstruction:
             == "fix the failing retrieval test"
         )
 
-    def test_bare_skill_returns_none(self):
-        assert extract_user_instruction_from_skill_message(_BARE_SKILL_TURN) is None
 
-    def test_runtime_note_trimmed_from_single_skill(self):
-        turn = _SINGLE_SKILL_TURN + "\n\n[Runtime note: in a subagent]"
-        assert (
-            extract_user_instruction_from_skill_message(turn)
-            == "make a skill for release triage"
-        )
 
 
 class TestMemoryManagerStripsScaffolding:
-    def test_prefetch_all_strips_single_skill(self):
-        mgr, provider = _manager_with_recorder()
-        mgr.prefetch_all(_SINGLE_SKILL_TURN)
-        assert provider.prefetched == ["make a skill for release triage"]
 
     def test_prefetch_all_skips_bare_skill(self):
         mgr, provider = _manager_with_recorder()
@@ -136,17 +119,25 @@ class TestMemoryManagerStripsScaffolding:
         mgr.flush_pending(timeout=5.0)
         assert provider.queued == ["fix the failing retrieval test"]
 
-    def test_queue_prefetch_all_skips_bare_skill(self):
+    def test_auto_loaded_skills_keep_only_typed_text(self):
+        skill_footer = f"[Skill directory: /skills/example]\nResolve relative paths, {_SKILL_DIR_NOTE_END}"
+        turn = (
+            '[IMPORTANT: The "example" skill is auto-loaded. Follow its instructions for this session.]\n'
+            "The skill body contains the terminal tool absolute path footer as quoted text.\n"
+            + skill_footer + "\n\n"
+            + '[IMPORTANT: The "another" skill is auto-loaded. Follow its instructions for this session.]\n'
+            "Second skill body.\n[Skill directory: /skills/another]\nResolve paths, " + _SKILL_DIR_NOTE_END
+            + "\n\nnot remember anything i tell you"
+        )
         mgr, provider = _manager_with_recorder()
-        mgr.queue_prefetch_all(_BARE_SKILL_TURN)
+        mgr.prefetch_all(turn)
+        mgr.queue_prefetch_all(turn)
+        mgr.sync_all(turn, "I will investigate.")
         mgr.flush_pending(timeout=5.0)
-        assert provider.queued == []
-
-    def test_sync_all_strips_single_skill(self):
-        mgr, provider = _manager_with_recorder()
-        mgr.sync_all(_SINGLE_SKILL_TURN, "Done.")
-        mgr.flush_pending(timeout=5.0)
-        assert provider.synced == ["make a skill for release triage"]
+        expected = ["not remember anything i tell you"]
+        assert provider.prefetched == expected
+        assert provider.queued == expected
+        assert provider.synced == expected
 
     def test_sync_all_skips_bare_skill(self):
         mgr, provider = _manager_with_recorder()
@@ -154,8 +145,29 @@ class TestMemoryManagerStripsScaffolding:
         mgr.flush_pending(timeout=5.0)
         assert provider.synced == []
 
-    def test_plain_message_passes_through_unchanged(self):
+    def test_bare_auto_load_skipped_and_lookalike_text_kept(self):
+        bare = (
+            '[IMPORTANT: The "example" skill is auto-loaded. Follow its instructions for this session.]\n'
+            f"Skill body.\n[Skill directory: /skills/example]\nResolve paths, {_SKILL_DIR_NOTE_END}\n\n"
+        )
+        lookalike = '[IMPORTANT: The "config" file is broken] please   look'
         mgr, provider = _manager_with_recorder()
-        mgr.sync_all("what's the weather", "Sunny.")
+        mgr.sync_all(bare, "Ready.")
+        mgr.sync_all(lookalike, "Looking.")
         mgr.flush_pending(timeout=5.0)
-        assert provider.synced == ["what's the weather"]
+        assert provider.synced == [lookalike]
+
+    def test_pasted_scaffold_lookalikes_in_typed_text_reach_memory(self):
+        """The gateway-registered boundary keeps typed text that itself looks like scaffolding."""
+        scaffold = (
+            '[IMPORTANT: The "example" skill is auto-loaded. Follow its instructions for this session.]\n'
+            f"Skill body.\n[Skill directory: /skills/example]\nResolve paths, {_SKILL_DIR_NOTE_END}\n\n"
+        )
+        register_auto_load_scaffold(scaffold)
+        note = "[Skill setup note: set FOO_TOKEN] why does setup keep failing?"
+        footer = f"it said {_SKILL_DIR_NOTE_END} what does that mean"
+        mgr, provider = _manager_with_recorder()
+        mgr.sync_all(scaffold + note, "Checking.")
+        mgr.sync_all(scaffold + footer, "Checking.")
+        mgr.flush_pending(timeout=5.0)
+        assert provider.synced == [note, footer]

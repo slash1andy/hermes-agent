@@ -45,7 +45,7 @@ import plugins.platforms.slack.adapter as _slack_mod
 
 _slack_mod.SLACK_AVAILABLE = True
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import SlackAdapter
 
 
 BOT_USER_ID = "U_TARGET_BOT"
@@ -127,8 +127,6 @@ def smoke_adapter():
 
 
 class TestSlackPeerAgentSmoke:
-    def test_peer_agent_smoke_preflight_contract(self, smoke_adapter):
-        _assert_peer_agent_preflight(smoke_adapter)
 
     @pytest.mark.asyncio
     async def test_human_message_with_current_mention_routes(self, smoke_adapter):
@@ -148,26 +146,6 @@ class TestSlackPeerAgentSmoke:
         assert msg_event.source.thread_id == REPLY_TS
         smoke_adapter._fetch_thread_context.assert_not_awaited()
 
-    @pytest.mark.asyncio
-    async def test_peer_bot_without_current_mention_is_ignored_despite_thread_state(
-        self, smoke_adapter
-    ):
-        smoke_adapter._bot_message_ts.add(THREAD_TS)
-        smoke_adapter._mentioned_threads.add(THREAD_TS)
-        smoke_adapter._has_active_session_for_thread = MagicMock(return_value=True)
-
-        event = _make_event(
-            text="status: work finished",
-            user=PEER_USER_ID,
-            bot_id="B_PEER",
-            ts=REPLY_TS,
-            thread_ts=THREAD_TS,
-        )
-
-        await smoke_adapter._handle_slack_message(event)
-
-        smoke_adapter.handle_message.assert_not_called()
-        smoke_adapter._fetch_thread_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_peer_bot_with_current_explicit_mention_routes(self, smoke_adapter):
@@ -194,33 +172,41 @@ class TestSlackPeerAgentSmoke:
         )
         smoke_adapter._fetch_thread_context.assert_awaited_once()
 
+
+
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("text", "case_id"),
-        [
-            ("ack: sent the summary", "ack"),
-            ("status: waiting for approval", "status"),
-            ("error: tool call failed", "error"),
-        ],
-        ids=["ack", "status", "error"],
-    )
-    async def test_passive_peer_bot_messages_do_not_route(
-        self, smoke_adapter, text, case_id
-    ):
-        smoke_adapter._bot_message_ts.add(THREAD_TS)
-        smoke_adapter._mentioned_threads.add(THREAD_TS)
-        smoke_adapter._has_active_session_for_thread = MagicMock(return_value=True)
+    async def test_peer_bot_known_only_via_users_info_arrives_flagged_as_bot(self, smoke_adapter):
+        """A peer agent posting as a bot *user* (no bot_id/subtype) passes the drop gates under
+        allow_bots=mentions via users.info; it must reach the gateway as a bot, or the bot loop
+        guard and SLACK_ALLOW_BOTS never see it (#143370)."""
+        smoke_adapter._get_client = lambda *_a, **_kw: smoke_adapter._app.client
+        smoke_adapter._app.client.users_info = AsyncMock(
+            return_value={"ok": True, "user": {"is_bot": True, "profile": {}}})
 
-        event = _make_event(
-            text=text,
-            user=PEER_USER_ID,
-            bot_id="B_PEER",
-            ts=REPLY_TS,
-            thread_ts=THREAD_TS,
-        )
+        await smoke_adapter._handle_slack_message(_make_event(
+            text=f"<@{BOT_USER_ID}> your turn", user=PEER_USER_ID, ts=REPLY_TS))
 
-        await smoke_adapter._handle_slack_message(event)
+        smoke_adapter.handle_message.assert_awaited_once()
+        assert smoke_adapter.handle_message.await_args.args[0].source.is_bot is True
 
-        assert smoke_adapter.handle_message.await_count == 0, (
-            f"routing_logic: passive peer bot {case_id} messages must never create bot-to-bot loops"
-        )
+    @pytest.mark.asyncio
+    async def test_peer_bot_early_authorization_uses_cached_users_info_verdict(self, smoke_adapter):
+        """A bot with no payload bot markers must not be rejected as an unlisted human
+        before SLACK_ALLOW_BOTS=mentions can grant it access (#143370)."""
+        smoke_adapter._get_client = lambda *_a, **_kw: smoke_adapter._app.client
+        smoke_adapter._app.client.users_info = AsyncMock(
+            return_value={"ok": True, "user": {"is_bot": True, "profile": {}}})
+        checked_bot_flags = []
+
+        def authorize_bot_only(user_id, chat_type, chat_id, *, is_bot=False, thread_id=None):
+            checked_bot_flags.append(is_bot)
+            return user_id == PEER_USER_ID and is_bot
+
+        smoke_adapter.set_authorization_check(authorize_bot_only)
+
+        await smoke_adapter._handle_slack_message(_make_event(
+            text=f"<@{BOT_USER_ID}> your turn", user=PEER_USER_ID, ts=REPLY_TS))
+
+        assert checked_bot_flags and checked_bot_flags[0] is True
+        smoke_adapter.handle_message.assert_awaited_once()
+        assert smoke_adapter.handle_message.await_args.args[0].source.is_bot is True

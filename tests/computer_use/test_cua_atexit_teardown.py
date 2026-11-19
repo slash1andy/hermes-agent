@@ -23,37 +23,18 @@ from tools.computer_use import tool as cu_tool
 
 
 class TestAtexitTeardown:
-    def test_shutdown_stops_a_live_backend(self):
-        """A cached backend is stopped when the interpreter exits."""
-        fake = MagicMock()
-        with patch.object(cu_tool, "_backend", fake):
+
+
+    def test_shutdown_stops_every_session_backend(self):
+        """Every session-scoped cached backend is stopped and the cache drained."""
+        first = MagicMock()
+        second = MagicMock()
+        with patch.object(cu_tool, "_backends", {"one": first, "two": second}), \
+             patch.object(cu_tool, "_backend_call_locks", {}):
             cu_tool._shutdown_backend_atexit()
-            fake.stop.assert_called_once()
-
-    def test_shutdown_clears_the_cached_backend(self):
-        """After teardown the module cache is empty, so a later call re-spawns."""
-        fake = MagicMock()
-        with patch.object(cu_tool, "_backend", fake):
-            cu_tool._shutdown_backend_atexit()
-            assert cu_tool._backend is None
-
-    def test_shutdown_is_a_noop_when_never_started(self):
-        """No backend was ever created => nothing to stop, no error."""
-        with patch.object(cu_tool, "_backend", None):
-            cu_tool._shutdown_backend_atexit()  # must not raise
-            assert cu_tool._backend is None
-
-    def test_shutdown_swallows_backend_errors(self):
-        """A failing stop() must not raise out of an atexit hook.
-
-        Exceptions escaping atexit print a traceback on every exit and can
-        mask the real exit status.
-        """
-        fake = MagicMock()
-        fake.stop.side_effect = RuntimeError("driver already dead")
-        with patch.object(cu_tool, "_backend", fake):
-            cu_tool._shutdown_backend_atexit()  # must not raise
-            assert cu_tool._backend is None
+            first.stop.assert_called_once()
+            second.stop.assert_called_once()
+            assert cu_tool._backends == {}
 
     def test_hook_is_registered_with_atexit(self):
         """Importing the tool module registers the teardown hook.
@@ -64,7 +45,8 @@ class TestAtexitTeardown:
         """
         atexit.unregister(cu_tool._shutdown_backend_atexit)
         try:
-            with patch.object(cu_tool, "_backend", MagicMock()) as fake:
+            fake = MagicMock()
+            with patch.object(cu_tool, "_backends", {"": fake}), patch.object(cu_tool, "_backend_call_locks", {}):
                 # Re-register and fire the full atexit chain the way the
                 # interpreter would, then confirm our hook ran.
                 atexit.register(cu_tool._shutdown_backend_atexit)

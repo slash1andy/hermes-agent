@@ -20,14 +20,8 @@
  * the managed route with in-app billing (desktop Settings → Billing, TUI
  * `/topup`), while third-party providers deep-link to `billing_url`.
  */
-export interface BillingBlock {
-  provider: string
-  provider_label: string
-  model: string
-  billing_url: string | null
-  is_nous: boolean
-  message: string
-}
+export type { BillingBlock } from './gateway-contract.generated.js'
+import type { PlanUsage } from './gateway-contract.generated.js'
 
 // ── Remote Spending (Phase 2b) ───────────────────────────────────────
 
@@ -122,6 +116,47 @@ export interface BillingCardInfo {
   resolved_via?: null | string
 }
 
+/**
+ * The org's payment method on file.
+ *
+ * This is the authoritative field. `card` is a lossy older view of the same
+ * thing: it is populated only when the method is a card, and is null for
+ * every other kind — so `!card` does NOT mean "no payment method on file".
+ * A surface that gates on `card` alone will tell a Link customer they have
+ * nothing on file.
+ *
+ * Older gateways omit this field entirely, so absence means "this gateway
+ * didn't say", not "nothing on file".
+ *
+ * A kind this client predates arrives as `unknown` rather than as its real
+ * name, which keeps `kind` narrowable — every arm is a literal, so
+ * `if (pm.kind === 'card')` gives you the card fields. (The `string & {}`
+ * trick used by BillingRefusalCode does not work here: on an object union it
+ * makes the discriminant non-literal and defeats narrowing for every arm.)
+ */
+export type BillingPaymentMethod =
+  | {
+      kind: 'card'
+      brand: string
+      last4: string
+      /** Wallet that wrapped the card (e.g. "apple_pay", "google_pay"), if any. */
+      wallet: string | null
+      /** Card-resolution rung ("subPin" | "customerDefault" | "autoRefill") or null. */
+      resolved_via: null | string
+    }
+  | {
+      kind: 'link'
+      /** Link displays as the account email; can be absent on the Stripe side. */
+      email: null | string
+      resolved_via: null | string
+    }
+  | {
+      kind: 'unknown'
+      /** What the server actually called it, for logs and neutral copy. */
+      raw_kind: string
+      resolved_via: null | string
+    }
+
 export interface BillingMonthlyCap {
   is_default_ceiling: boolean
   limit_display: string
@@ -159,10 +194,16 @@ export interface BillingStateResponse {
   can_change_plan?: boolean
   can_charge: boolean
   card: BillingCardInfo | null
+  // Typed payment-method union (newer gateways only); `card` remains the
+  // compatibility field and stays populated for kind "card".
+  payment_method?: BillingPaymentMethod | null
   charge_presets: string[]
   charge_presets_display: string[]
   cli_billing_enabled: boolean
   error?: string | null
+  // Window plans: "Keep going on credits".
+  // Absent/null = no control (not a billing admin, other plan, older gateway).
+  keep_going_on_credits?: boolean | null
   is_admin: boolean
   logged_in: boolean
   max_usd: string | null
@@ -175,6 +216,10 @@ export interface BillingStateResponse {
   // Shared dollar usage model (two-bar view), embedded by the gateway so /topup
   // renders the same bars as /usage and /subscription from this single fetch.
   usage?: UsageModelData
+  // Usage-window gauges (today / week / month / large models). For window plans
+  // `usage` is unavailable, so this is what the bars draw from.
+  // Absent/null on credit-grant, free and logged-out accounts and older gateways.
+  plan_usage?: PlanUsage | null
 }
 
 /**
@@ -270,6 +315,7 @@ export interface SubscriptionStateResponse {
   // Shared dollar usage model (two-bar view), embedded by the gateway so the
   // overlay renders the same bars as /usage from this single fetch.
   usage?: UsageModelData
+  plan_usage?: PlanUsage | null
 }
 
 // A chargeless quote (POST /subscription/preview) of what a change would do.
