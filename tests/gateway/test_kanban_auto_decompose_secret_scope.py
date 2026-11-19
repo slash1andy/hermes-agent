@@ -29,11 +29,16 @@ def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkey
 
     seen = {}
 
-    def fake_decompose(task_id, author=None):
+    def fake_decompose(task_id, author=None, auto=False):
         seen["value"] = ss.get_secret("ANTHROPIC_API_KEY")
+        seen["decompose_auto"] = auto
         return SimpleNamespace(ok=True, fanout=False, child_ids=None, reason=None)
 
-    fake = SimpleNamespace(list_triage_ids=lambda: ["t1"], decompose_task=fake_decompose)
+    def fake_list(auto=False):
+        seen["list_auto"] = auto
+        return ["t1"]
+
+    fake = SimpleNamespace(list_triage_ids=fake_list, decompose_task=fake_decompose)
     monkeypatch.setitem(sys.modules, "hermes_cli.kanban_decompose", fake)
     monkeypatch.setattr(hermes_cli, "kanban_decompose", fake, raising=False)
 
@@ -46,6 +51,8 @@ def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkey
 
     assert decomposed == 1
     assert seen["value"] == "launch-profile-key"
+    # Only the gateway's automatic path opts into the genuine-intake restriction.
+    assert seen["list_auto"] is True and seen["decompose_auto"] is True
     assert ss.current_secret_scope() is None
 
 
@@ -66,14 +73,14 @@ def test_auto_decompose_board_pin_stays_inside_the_tick(monkeypatch, tmp_path):
 
     seen = {}
 
-    def fake_decompose(task_id, author=None):
+    def fake_decompose(task_id, author=None, auto=False):
         seen["tick"] = kb.get_current_board()
         other = threading.Thread(target=lambda: seen.update(other=kb.get_current_board()))
         other.start()
         other.join()
         return SimpleNamespace(ok=True, fanout=False, child_ids=None, reason=None)
 
-    fake = SimpleNamespace(list_triage_ids=lambda: ["t1"], decompose_task=fake_decompose)
+    fake = SimpleNamespace(list_triage_ids=lambda auto=False: ["t1"], decompose_task=fake_decompose)
     monkeypatch.setitem(sys.modules, "hermes_cli.kanban_decompose", fake)
     monkeypatch.setattr(hermes_cli, "kanban_decompose", fake, raising=False)
 

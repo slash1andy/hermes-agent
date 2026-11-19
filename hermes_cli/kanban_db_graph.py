@@ -5,6 +5,31 @@ import sqlite3
 import time
 from typing import Any, Optional
 
+# Genuine new intake: triage with no escalation/fan-out history and no graph links.
+# Breaker-routed, already fanned-out and graph-member tasks need a human, not another
+# automatic decomposition. Shared by selection and by both mutation transactions.
+INTAKE_WHERE = (
+    "tasks.status = 'triage' AND tasks.block_kind IS NULL"
+    " AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = tasks.id"
+    " AND e.kind IN ('block_loop_detected', 'gave_up', 'decomposed'))"
+    " AND NOT EXISTS (SELECT 1 FROM task_links l WHERE tasks.id IN (l.parent_id, l.child_id))"
+)
+
+
+def list_intake_ids(
+    conn: sqlite3.Connection, *, task_id: Optional[str] = None, tenant: Optional[str] = None,
+    limit: int = 1000,
+) -> list[str]:
+    """Ids of genuine-intake triage tasks, oldest first; optionally one task / one tenant."""
+    sql, params = "SELECT id FROM tasks WHERE " + INTAKE_WHERE, []
+    for column, value in (("id", task_id), ("tenant", tenant)):
+        if value is not None:
+            sql += f" AND tasks.{column} = ?"
+            params.append(value)
+    rows = conn.execute(sql + " ORDER BY created_at, id LIMIT ?", (*params, limit))
+    return [row["id"] for row in rows]
+
+
 def inherit_creator_origin(
     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,
     created_at: int,
@@ -89,7 +114,7 @@ def _validate_children_graph(children: list) -> None:
 
 def decompose_triage_task(
     conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
-    author: Optional[str] = None, auto_promote: bool = True,
+    author: Optional[str] = None, auto_promote: bool = True, intake_only: bool = False,
 ) -> Optional[list[str]]:
     """Fan a triage task out into children and move the root to ``todo``; the root
     waits on every child and wakes (``ready``) when all are done.
@@ -98,6 +123,7 @@ def decompose_triage_task(
     ``parents`` (indices into this list), optional workspace overrides.
     Returns child ids in input order, or None when the root is missing / not
     in triage, or has already decomposed. Atomic: malformed entries abort fan-out.
+    ``intake_only`` (gateway auto path) also requires ``INTAKE_WHERE`` inside the txn.
     """
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
@@ -116,7 +142,7 @@ def decompose_triage_task(
     with write_txn(conn):
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?", (task_id,),
+            "FROM tasks WHERE id = ?" + (" AND " + INTAKE_WHERE if intake_only else ""), (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
             return None

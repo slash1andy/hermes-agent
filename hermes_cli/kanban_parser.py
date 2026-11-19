@@ -146,6 +146,13 @@ _BOARD_SPECS = [
     )),
 ]
 
+_EXPECT_GUARD_HELP = ("Automation only: the `block_guard` from `show --json`. One id; changes the card only if "
+                      "its task, events and runs are unchanged since that read, else writes nothing.")
+
+_EXPECT_RELATED_HELP = ("Automation only, with --expect-guard: TASK_ID:TOKEN, the `block_guard` of ANOTHER task on this "
+                        "board from `show --json`. The unblock applies only if that task is unchanged too, checked in the "
+                        "same write transaction; else nothing is written.")
+
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
 _SPECS = [
     _cmd("init", help="Create kanban.db if missing (idempotent)"),
@@ -322,6 +329,7 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--expect-guard", metavar="TOKEN", help=_EXPECT_GUARD_HELP),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -330,6 +338,8 @@ _SPECS = [
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _arg("--expect-guard", metavar="TOKEN", help=_EXPECT_GUARD_HELP),
+        _arg("--expect-related", metavar="TASK_ID:TOKEN", help=_EXPECT_RELATED_HELP),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [

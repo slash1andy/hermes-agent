@@ -1243,7 +1243,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
     Nesting is an explicit opt-in (``allow_nested=True`` → savepoint; otherwise
     a loud ``RuntimeError``). Only composition primitives (``create_task``,
-    ``add_comment``) opt in — helpers with post-commit side effects
+    ``add_comment``, ``unblock_task``) opt in — helpers with post-commit side effects
     (``complete_task`` & co.) must never run under an open outer transaction,
     since those side effects would fire while the outer txn can still roll back.
     """

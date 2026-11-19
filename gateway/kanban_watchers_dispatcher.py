@@ -267,7 +267,7 @@ class _KanbanDispatcher:
                 # and spawned subprocess that names no board would resolve this one instead.
                 with scoped_current_board(slug):
                     try:
-                        triage_ids = _decomp.list_triage_ids()
+                        triage_ids = _decomp.list_triage_ids(auto=True)
                     except Exception as exc:
                         logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
                         triage_ids = []
@@ -282,7 +282,7 @@ class _KanbanDispatcher:
     def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:
         """Decompose one triage task; returns 1 on success, 0 otherwise."""
         try:
-            outcome = _decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decomp.decompose_task(tid, author="auto-decomposer", auto=True)
         except Exception:
             logger.exception("kanban auto-decompose: decompose_task crashed on %s", tid)
             return 0

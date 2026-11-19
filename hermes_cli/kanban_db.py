@@ -27,8 +27,9 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
+from hermes_cli.kanban_db_graph import INTAKE_WHERE
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
@@ -3123,8 +3124,8 @@ def edit_task(
 
 
 def block_task(
-    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, kind: Optional[str] = None,
+    expected_run_id: Optional[int] = None, precondition: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3146,7 +3147,7 @@ def block_task(
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if cur_row is None:
+        if cur_row is None or (precondition is not None and not precondition()):  # evaluated INSIDE this write txn
             return False
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
         # ``block_kind`` and no ``blocked`` event -- the policy is the
@@ -3558,7 +3559,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3732,17 +3733,16 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    intake_only: bool = False,
 ) -> bool:
-    """Update title/body/assignee (when given) and move ``triage -> todo`` in one
-    txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
-    gating still applies; the audit comment is written only when a field changed.
-    """
+    """Update triage to parent-gated todo atomically; require intake if requested and audit only changed fields."""
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'"
+            + (" AND " + INTAKE_WHERE if intake_only else ""),
             (task_id,),
         ).fetchone()
         if existing is None:

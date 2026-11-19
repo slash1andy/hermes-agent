@@ -8,6 +8,7 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -250,3 +251,72 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+# --- auto mode: genuine new intake only (gateway auto-decompose) ------------
+
+_FANOUT = jsonlib.dumps({"fanout": True, "tasks": [{"title": "a"}, {"title": "b", "parents": [0]}]})
+_SINGLE = jsonlib.dumps({"fanout": False, "title": "tight", "body": "spec"})
+
+
+def _with_profiles(stack, names=("orchestrator",)):
+    for p in _patch_list_profiles(list(names)):
+        stack.enter_context(p)
+
+
+def test_auto_selection_is_tenant_filtered_oldest_first_and_manual_unchanged(kanban_home):
+    with kbc.connect() as conn:
+        late = kb.create_task(conn, title="late", triage=True, tenant="a")
+        tie_x = kb.create_task(conn, title="x", triage=True, tenant="a")
+        tie_y = kb.create_task(conn, title="y", triage=True, tenant="a")
+        other = kb.create_task(conn, title="other", triage=True, tenant="b")
+        escalated = kb.create_task(conn, title="escalated", triage=True, tenant="a")
+        with kb.write_txn(conn):
+            kb._append_event(conn, escalated, "block_loop_detected", {"kind": "x"})
+            for tid, created in ((late, 20), (tie_x, 10), (tie_y, 10), (other, 5), (escalated, 1)):
+                conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created, tid))
+    assert decomp.list_triage_ids(auto=True, tenant="a") == [*sorted([tie_x, tie_y]), late]
+    assert set(decomp.list_triage_ids(tenant="a")) == {late, tie_x, tie_y, escalated}
+
+
+def test_auto_rejects_ineligible_task_before_any_model_call(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="escalated", triage=True)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "gave_up", {"error": "boom"})
+    with _patch_aux_client(_FANOUT) as call_llm:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer", auto=True)
+    assert outcome.ok is False
+    call_llm.assert_not_called()
+
+
+def test_manual_decompose_of_escalated_linked_root_still_fans_out(kanban_home):
+    with kbc.connect() as conn:
+        prerequisite = kb.create_task(conn, title="prerequisite")
+        tid = kb.create_task(conn, title="root", triage=True, parents=[prerequisite])
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "block_loop_detected", {"kind": "x"})
+    with ExitStack() as stack:
+        _with_profiles(stack)
+        stack.enter_context(_patch_aux_client(_FANOUT))
+        outcome = decomp.decompose_task(tid, author="me")
+    assert outcome.ok and outcome.fanout and len(outcome.child_ids) == 2
+
+
+@pytest.mark.parametrize("payload", [_FANOUT, _SINGLE], ids=["fanout", "specify"])
+def test_auto_eligibility_lost_during_model_call_is_rejected_at_write(kanban_home, payload):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough idea", triage=True, assignee="orchestrator")
+
+    def escalate_then_reply(*args, **kwargs):
+        with kbc.connect_closing() as conn, kb.write_txn(conn):
+            kb._append_event(conn, tid, "block_loop_detected", {"kind": "x"})
+        return _fake_aux_response(payload)
+
+    with ExitStack() as stack:
+        _with_profiles(stack)
+        call_llm = stack.enter_context(patch("agent.auxiliary_client.call_llm", side_effect=escalate_then_reply))
+        outcome = decomp.decompose_task(tid, author="auto-decomposer", auto=True)
+    assert outcome.ok is False
+    call_llm.assert_called_once()
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1

@@ -147,3 +147,121 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     assert calls == []
     with closing(connect(board='owned')) as conn:
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='owner_admitted'", (task_id,)).fetchone()[0] == 0
+
+
+def _claimed_frame(tmp_path, monkeypatch, workspace_of_root):
+    """The frame of a genuine admitted claim on a task living in ``<workspaces root>/task-1``; the
+    workspace its context carries is ``workspace_of_root(root)``. A broad fence is inherited."""
+    import os
+    from contextlib import closing
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from gateway.session_contract import SessionActor
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HOME', str(tmp_path / 'home'))
+    monkeypatch.setenv('HERMES_WRITE_SAFE_ROOT', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    monkeypatch.delenv('HERMES_DELEGATED_CHILD', raising=False)
+    monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda name: str(tmp_path) if name == 'default' else str(tmp_path / name))
+    kb.create_board('owned')
+    root = kb.workspaces_root(board='owned')
+    root.mkdir(parents=True, exist_ok=True)
+    workspace = root / 'task-1'
+    workspace.mkdir()
+    with closing(connect(board='owned')) as conn:
+        task_id = kb.create_task(conn, title='Owned fence', assignee='default', workspace_kind='dir', workspace_path=str(workspace))
+        kb.recompute_ready(conn)
+        task = kb.claim_task(conn, task_id)
+    actor = SessionActor('owner', str(tmp_path), frozenset({'session:create'}), 'transport')
+    connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)), actor=actor, native_owner=True)
+    from gateway.session_kanban import build_kanban_policy
+    config = {'model': {'default': 'loop-model', 'provider': 'custom'}, 'platform_toolsets': {'cli': ['terminal']}}
+    policy, _secrets = build_kanban_policy(connection, dict(board='owned', task_id=task.id, run_id=task.current_run_id,
+                                                           claim_lock=task.claim_lock), config)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(os, 'chdir', lambda path: None)  # the fence is decided before the chdir
+    monkeypatch.setattr('gateway.session_kanban._watch_submitter', lambda db, run_id: None)
+    monkeypatch.setattr(os, 'environ', os.environ.copy())
+    context = json.loads(policy.kanban_json) | {'workspace': str(workspace_of_root(root))}
+    return {'policy': {'source': 'kanban', 'kanban_json': json.dumps(context)}}, task, root
+
+
+def _escape_by_symlink(root):
+    outside = root.parent / 'outside'
+    outside.mkdir()
+    (root / 'link').symlink_to(outside, target_is_directory=True)
+    return root / 'link'
+
+
+def _file(root):
+    path = root / 'file'
+    path.write_text('x')
+    return path
+
+
+def _pathsep_task_dir(root):
+    import os
+    path = root / f'a{os.pathsep}b'
+    path.mkdir()
+    return path
+
+
+def _pathsep_ancestor(root):
+    import os
+    path = root / f'a{os.pathsep}b' / 'task'
+    path.mkdir(parents=True)
+    return path
+
+
+@pytest.mark.parametrize('workspace_of_root, fenced', [
+    (lambda root: root / 'task-1', True),
+    (lambda root: root, False),
+    (lambda root: root.parent, False),
+    (_escape_by_symlink, False),
+    (_file, False),
+    (lambda root: root / 'missing', False),
+    (_pathsep_task_dir, False),
+    (_pathsep_ancestor, False),
+], ids=['task_dir', 'board_root', 'outside_root', 'symlink_escape', 'file', 'nonexistent', 'pathsep_task_dir', 'pathsep_ancestor'])
+def test_bound_worker_fences_writes_to_its_task_directory(tmp_path, monkeypatch, workspace_of_root, fenced):
+    import os
+    frame, task, root = _claimed_frame(tmp_path, monkeypatch, workspace_of_root)
+    from gateway.session_kanban import bind_worker_context
+    bind_worker_context(frame)
+    assert os.environ['HERMES_KANBAN_TASK'] == task.id
+    if fenced:
+        assert os.environ['HERMES_WRITE_SAFE_ROOT'] == os.path.realpath(root / 'task-1')
+    else:  # an unqualified task directory drops the inherited fence rather than denying the worker
+        assert 'HERMES_WRITE_SAFE_ROOT' not in os.environ
+        from agent.file_safety import get_safe_write_roots
+        assert get_safe_write_roots() == set()  # the consumer is handed no fabricated roots
+
+
+def test_bound_worker_relative_workspace_drops_inherited_fence(tmp_path, monkeypatch):
+    import os
+    frame, _task, _root = _claimed_frame(
+        tmp_path, monkeypatch, lambda root: os.path.relpath(root / 'task-1', tmp_path))  # exists from the cwd, not absolute
+    from gateway.session_kanban import bind_worker_context
+    bind_worker_context(frame)
+    assert 'HERMES_WRITE_SAFE_ROOT' not in os.environ
+
+
+def test_stale_claim_installs_no_fence_and_non_kanban_worker_keeps_env(tmp_path, monkeypatch):
+    import os
+    from contextlib import closing
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from persistence.core.errors import AuthorityRefusal
+    from gateway.session_kanban import bind_worker_context
+    frame, task, _root = _claimed_frame(tmp_path, monkeypatch, lambda root: root / 'task-1')
+    inherited = os.environ['HERMES_WRITE_SAFE_ROOT']
+    with closing(connect(board='owned')) as conn:
+        kb.block_task(conn, task.id, reason='replace claim', expected_run_id=task.current_run_id)
+        kb.unblock_task(conn, task.id)
+        kb.claim_task(conn, task.id)
+    with pytest.raises(AuthorityRefusal, match='stale_kanban_claim'):
+        bind_worker_context(frame)
+    assert os.environ['HERMES_WRITE_SAFE_ROOT'] == inherited and os.environ.get('HERMES_KANBAN_TASK') != task.id
+    bind_worker_context({'policy': {'source': 'cli', 'kanban_json': None}})
+    assert os.environ['HERMES_WRITE_SAFE_ROOT'] == inherited

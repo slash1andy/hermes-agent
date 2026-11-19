@@ -5,6 +5,7 @@ from contextlib import closing
 from dataclasses import asdict, replace
 import threading
 import json
+import os
 from pathlib import Path
 import sqlite3
 
@@ -153,6 +154,19 @@ async def run_task(connection, params):
     return {'session_id': ref.session_id, 'receipt': asdict(receipt)}
 
 
+def _task_write_root(workspace, root):
+    """Task directory for the worker's optional ``HERMES_WRITE_SAFE_ROOT`` fence: an absolute,
+    existing directory strictly below the board's workspace root once symlinks resolve, whose path
+    holds no ``os.pathsep`` (the fence is a pathsep-separated list, so it could not be named); else None."""
+    if not workspace or not Path(workspace).is_absolute():
+        return None
+    try:
+        path, base = Path(workspace).resolve(strict=True), Path(root).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return str(path) if path.is_dir() and base in path.parents and os.pathsep not in str(path) else None
+
+
 def bind_worker_context(frame):
     """Only the adopted private exec calls this, before tool discovery imports."""
     import os
@@ -198,6 +212,13 @@ def bind_worker_context(frame):
     expires = json.loads(claimed[0]).get('expires') if claimed else None
     if isinstance(expires, int) and claimed[1]:
         env['HERMES_KANBAN_CLAIM_TTL_SECONDS'] = str(max(1, expires - int(claimed[1])))
+    # After the claim check: the fence is the task's own directory, and an unqualified workspace
+    # drops any wider inherited fence. File-safety heuristic only, not OS containment.
+    fence = _task_write_root(context['workspace'], context['workspaces_root'])
+    if fence:
+        env['HERMES_WRITE_SAFE_ROOT'] = fence
+    else:
+        os.environ.pop('HERMES_WRITE_SAFE_ROOT', None)
     _watch_submitter(Path(context['db']), context['run_id'])
     os.environ.update(env)
     os.chdir(context['workspace'])

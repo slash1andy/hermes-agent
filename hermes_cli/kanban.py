@@ -23,6 +23,7 @@ from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_workflow
+from hermes_cli.kanban_db_guard import block_guard, block_if_guard, is_guard_token, parse_related, unblock_if_guard
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
@@ -157,6 +158,11 @@ def kanban_command(args: argparse.Namespace) -> int:
     # the `--board` routing override (else `--board beta boards show` reports beta).
     if action == "boards":
         return _dispatch_boards(args)
+
+    # An invalid --expect-guard must refuse before auto-init or any other store setup creates kanban.db.
+    guard_ids = _GUARD_VERB_IDS.get(action)
+    if guard_ids and (rc := _guard_args(args, action, guard_ids(args))[2]):
+        return rc
 
     # `--board <slug>` pins HERMES_KANBAN_BOARD for the duration of this call so it inherits the
     # exact resolution the dispatcher uses for workers.
@@ -486,6 +492,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        guard_runs = kb.list_runs(conn, args.task_id) if rsk else runs  # the guard binds ALL runs, not a filter
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
         if not want_json:
@@ -494,6 +501,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if want_json:
         _print_json({
             "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
+            "block_guard": block_guard(task, events, guard_runs),
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
@@ -979,11 +987,44 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
     return run
 
 
+def _expect_guard(args: argparse.Namespace, verb: str, ids: list[str]) -> tuple[Optional[str], int]:
+    """``--expect-guard``: ``(None, 0)`` when absent; a supplied value (even '') must be a one-id 64-hex token,
+    else ``(None, 2)`` BEFORE any store is opened, so an invalid guard can never fall through to an unguarded write."""
+    token = getattr(args, "expect_guard", None)
+    if token is None:
+        return None, 0
+    if not is_guard_token(token):
+        return None, _err(f"kanban {verb}: --expect-guard must be the 64-hex `block_guard` from `show --json`", 2)
+    if len(ids) != 1:
+        return None, _err(f"kanban {verb}: --expect-guard needs exactly one task id", 2)
+    return token, 0
+
+
+def _guard_args(args: argparse.Namespace, verb: str, ids: list[str]) -> tuple[Optional[str], Optional[tuple[str, str]], int]:
+    """``(guard, related, rc)``. ``--expect-related`` needs a valid ``--expect-guard`` and another task; refused before any store is opened."""
+    guard, rc = _expect_guard(args, verb, ids)
+    raw = getattr(args, "expect_related", None)
+    if rc or raw is None:
+        return guard, None, rc
+    related = parse_related(raw)
+    if related is None:
+        return guard, None, _err(f"kanban {verb}: --expect-related must be TASK_ID:<64-hex `block_guard` from `show --json`>", 2)
+    if guard is None or related[0] in ids:
+        return guard, None, _err(f"kanban {verb}: --expect-related needs --expect-guard and a task other than the one changed", 2)
+    return guard, related, 0
+
+
+_GUARD_VERB_IDS = {"block": _bulk_ids, "unblock": lambda args: list(args.task_ids or [])}
+
+
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = _bulk_ids(args)
+    guard, rc = _expect_guard(args, "block", ids)
+    if rc:
+        return rc
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
@@ -1001,9 +1042,16 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        def block(tid):
+            run_id = _worker_run_id_for(tid)
+            if guard:
+                return block_if_guard(conn, tid, guard, reason=reason, kind=kind, expected_run_id=run_id)
+            return kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=run_id)
+
+        # Guarded: the reason lives in the blocked event; a pre-comment would outlive a refused block.
+        op = block if guard else _commented(conn, reason, author, "BLOCKED", block)
+        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}" + (
+            " (not blockable, or its block state changed since --expect-guard was read; nothing written)" if guard else ""))
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -1026,7 +1074,17 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = _stripped_or_none(getattr(args, "reason", None))
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
+    guard, related, rc = _guard_args(args, "unblock", ids)
+    if rc:
+        return rc
     with kbc.connect_closing() as conn:
+        if guard:
+            # Guard(s) + comment + unblock in ONE write transaction (see kanban_db_guard).
+            comment = (author, f"UNBLOCK: {reason}") if reason else None
+            return _bulk_apply(ids, lambda tid: unblock_if_guard(conn, tid, guard, comment=comment, related=related),
+                               lambda tid: f"Unblocked {tid}{suffix}",
+                               lambda tid: f"cannot unblock {tid}: not blocked/scheduled, or its block state changed since --expect-guard was read"
+                                           f"{' (or the --expect-related task changed)' if related else ''} (nothing written)")
         op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")

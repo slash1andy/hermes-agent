@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_db_graph import decompose_triage_task
+from hermes_cli.kanban_db_graph import decompose_triage_task, list_intake_ids
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
@@ -218,7 +218,9 @@ def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
     )
 
 
-def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_single(
+    task: kb.Task, parsed: dict, routing: _Routing, author: str, *, auto: bool = False,
+) -> DecomposeOutcome:
     """``fanout=false``: single-task spec promotion (same effect as specify)."""
     title_val, body_val = _title_body(parsed)
     assignee_val = None
@@ -231,9 +233,10 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
     with kbc.connect_closing() as conn:
         ok = kb.specify_triage_task(
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
+            intake_only=auto,
         )
     if not ok:
-        return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
+        return DecomposeOutcome(task.id, False, "task moved out of triage or lost intake eligibility before promotion")
     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
 
 
@@ -271,7 +274,9 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
     return children, ""
 
 
-def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_fanout(
+    task_id: str, parsed: dict, routing: _Routing, author: str, *, auto: bool = False,
+) -> DecomposeOutcome:
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
         return DecomposeOutcome(task_id, False, "decomposer returned fanout=true with empty tasks list")
@@ -287,6 +292,7 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
                 children=children,
                 author=author,
                 auto_promote=routing.auto_promote,
+                intake_only=auto,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
@@ -294,7 +300,7 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
     if child_ids is None:
-        return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
+        return DecomposeOutcome(task_id, False, "task already decomposed, moved out of triage, or lost intake eligibility")
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children", fanout=True, child_ids=child_ids,
     )
@@ -305,13 +311,19 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    auto: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
     (not in triage, no aux client, API error, malformed/empty reply) surface
-    as ``ok=False``."""
+    as ``ok=False``. ``auto`` (gateway auto-decompose only) additionally requires genuine new
+    intake, checked before any aux call and again inside the write transaction."""
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+    if auto:
+        with kbc.connect_closing() as conn:
+            if not list_intake_ids(conn, task_id=task_id):
+                return DecomposeOutcome(task_id, False, "not genuine new intake")
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
@@ -332,12 +344,15 @@ def decompose_task(
 
     audit_author = author or _profile_author()
     if not parsed.get("fanout"):
-        return _apply_single(task, parsed, routing, audit_author)
-    return _apply_fanout(task_id, parsed, routing, audit_author)
+        return _apply_single(task, parsed, routing, audit_author, auto=auto)
+    return _apply_fanout(task_id, parsed, routing, audit_author, auto=auto)
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+def list_triage_ids(*, tenant: Optional[str] = None, auto: bool = False) -> list[str]:
+    """Return task ids currently in the triage column; ``auto`` keeps only genuine new
+    intake, oldest first (the gateway auto-decompose selection)."""
     with kbc.connect_closing() as conn:
+        if auto:
+            return list_intake_ids(conn, tenant=tenant)
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
     return [row.id for row in rows]
